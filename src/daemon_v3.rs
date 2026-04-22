@@ -112,13 +112,28 @@ pub async fn run(
 
     // Discover IPv6 addresses for each interface from VPP (the source
     // of truth — the v3 daemon programs VPP directly, not Linux).
+    // Retry for up to 8s: VPP enables IPv6 on an interface lazily
+    // (when the first v6 address is added or `ip6 enable` runs from
+    // commands-core.txt), and the link-local auto-assignment finishes
+    // a beat after that. The supervisor spawns imp-ospfd the moment
+    // VPP binds its API socket, which can pre-date the v6 init.
     let mut usable = Vec::new();
     for mut ic in cfg.interfaces.drain(..) {
-        let addrs = discover_addrs_vpp(&vpp, ic.sw_if_index).await;
+        let mut addrs = discover_addrs_vpp(&vpp, ic.sw_if_index).await;
+        if addrs.link_local.is_none() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                addrs = discover_addrs_vpp(&vpp, ic.sw_if_index).await;
+                if addrs.link_local.is_some() {
+                    break;
+                }
+            }
+        }
         let Some(ll) = addrs.link_local else {
             tracing::info!(
                 name = %ic.name,
-                "OSPFv3: no IPv6 link-local address in VPP, skipping interface"
+                "OSPFv3: no IPv6 link-local address in VPP after retries, skipping interface"
             );
             continue;
         };
@@ -268,7 +283,13 @@ pub async fn run(
     let mut expire_tick = tokio::time::interval(Duration::from_secs(1));
     let mut spf_tick = tokio::time::interval(Duration::from_secs(2));
     spf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut iface_refresh = tokio::time::interval(Duration::from_secs(30));
+    // Same startup-race avoidance as v2 (see main.rs::iface_refresh):
+    // skip the immediate first tick so we don't transiently see an
+    // empty IpAddressDump and demote the interface back to Down.
+    let mut iface_refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     iface_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {

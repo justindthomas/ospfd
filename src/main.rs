@@ -356,6 +356,28 @@ fn get_kernel_ifindex(name: &str) -> anyhow::Result<u32> {
         .map_err(|e| anyhow::anyhow!("invalid ifindex in {}: {}", path, e))
 }
 
+/// Resolve the kernel ifindex for `name`, retrying for up to
+/// `total_ms` milliseconds. LCP can take a second or two to
+/// materialize the TAP for a freshly-created VPP interface — impd's
+/// supervisor starts imp-ospfd right after VPP binds its API socket,
+/// which often pre-dates that materialization.
+fn resolve_kernel_ifindex(name: &str, total_ms: u64) -> anyhow::Result<u32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+    let mut last_err: Option<anyhow::Error> = None;
+    loop {
+        match get_kernel_ifindex(name) {
+            Ok(idx) => return Ok(idx),
+            Err(e) => {
+                last_err = Some(e);
+                if std::time::Instant::now() >= deadline {
+                    return Err(last_err.unwrap());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
 /// Enumerate all IPv4 prefixes on VPP interfaces that are NOT
 /// enrolled in OSPFv2. Used for `redistribute connected` — these are
 /// the prefixes emitted as Type 5 AS-External-LSAs. The OSPF-enrolled
@@ -702,15 +724,32 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             );
         }
 
-        let kernel_ifindex = match get_kernel_ifindex(&iface.name) {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::warn!(
-                    name = %iface.name,
-                    "failed to get kernel ifindex (interface may not have an LCP TAP): {}",
-                    e
-                );
-                continue;
+        // kernel_ifindex is only used by the raw backend (IP_ADD_MEMBERSHIP
+        // + IP_MULTICAST_IF on the LCP TAP). The punt backend doesn't
+        // need it — it sends via VPP's punt socket directly. FreeBSD
+        // has no /sys/class/net at all, so future FreeBSD support must
+        // rely on punt/VCL exclusively.
+        //
+        // For raw, retry the lookup with backoff: impd's supervisor
+        // can start imp-ospfd the moment VPP binds its API socket,
+        // which is often before LCP has materialized the TAPs in the
+        // dataplane netns. Retrying for a few seconds rides out that
+        // race cleanly.
+        let kernel_ifindex = match args.io_backend {
+            IoBackend::Raw => match resolve_kernel_ifindex(&iface.name, 6000) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %iface.name,
+                        "raw backend: no LCP TAP after retries, skipping: {}", e
+                    );
+                    continue;
+                }
+            },
+            IoBackend::Punt => {
+                // Best-effort — log it if available for diagnostics,
+                // but don't skip the interface on failure.
+                get_kernel_ifindex(&iface.name).unwrap_or(0)
             }
         };
 
@@ -852,13 +891,16 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     );
                     continue;
                 };
-                let kernel_ifindex = match get_kernel_ifindex(&ic.name) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        tracing::warn!(name = %ic.name,
-                            "OSPFv3: no kernel TAP ({}), skipping", e);
-                        continue;
-                    }
+                let kernel_ifindex = match args.io_backend {
+                    IoBackend::Raw => match resolve_kernel_ifindex(&ic.name, 6000) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::warn!(name = %ic.name,
+                                "OSPFv3 raw: no kernel TAP after retries, skipping: {}", e);
+                            continue;
+                        }
+                    },
+                    IoBackend::Punt => get_kernel_ifindex(&ic.name).unwrap_or(0),
                 };
                 let network_type = match ic.network_type.as_str() {
                     "point-to-point" => NetworkTypeV3::PointToPoint,
@@ -1007,7 +1049,22 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // admin/link state transitions for OSPF interfaces. Polling cadence
     // chosen to be slow enough to be cheap and fast enough that adjacency
     // recovery after a flap is bounded by ~refresh + dead_interval.
-    let mut iface_refresh = tokio::time::interval(Duration::from_secs(30));
+    //
+    // Start the first tick one period from now (interval_at), not
+    // immediately. The default `interval()` ticks straight away, which
+    // races VPP at startup: the initial resolution above just primed
+    // every interface from VPP's IpAddressDump, but firing the refresh
+    // microseconds later sometimes sees a transient empty dump (VPP
+    // mid-operation) and demotes the interface back to Down — which
+    // tears down everything the daemon just initialised, including the
+    // InterfaceUp transition. With the punt backend that race is
+    // perfectly reproducible because PuntSocketIo::new + register_punt
+    // adds enough VPP back-and-forth before the loop starts that VPP
+    // is still busy when the first tick fires.
+    let mut iface_refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     iface_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // SIGHUP re-reads the config file and calls OspfInstance::reload_config
