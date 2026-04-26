@@ -625,7 +625,10 @@ fn prefix_from_mask(mask: &str) -> u8 {
 }
 
 async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
+    // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
+    // stderr → journald.
     tracing_subscriber::fmt()
+        .with_ansi(std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(EnvFilter::from_default_env().add_directive("ospfd=info".parse()?))
         .init();
 
