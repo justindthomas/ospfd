@@ -3,9 +3,11 @@
 //! Reads the OSPF-relevant fields from /etc/ospfd/config.yaml.
 //! We define our own serde structs for just the fields we need.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+use ribd_routemap::{RouteMap, RouteMapYaml};
 use serde::Deserialize;
 
 /// Top-level router configuration (we only deserialize the fields we need).
@@ -19,6 +21,13 @@ pub struct RouterConfig {
     pub interfaces: Vec<InterfaceConfig>,
     #[serde(default)]
     pub loopbacks: Vec<LoopbackConfig>,
+    /// Top-level route-maps shared across daemons (bgpd, ospfd,
+    /// future producers). Each map is referenced by name from
+    /// per-protocol redistribute entries. Universal-clause-only
+    /// in v1 (`NoExtras`); ospfd-specific match/set extras are a
+    /// follow-up if/when needed.
+    #[serde(default)]
+    pub route_maps: Vec<RouteMapYaml>,
 }
 
 /// OSPF configuration block.
@@ -101,8 +110,8 @@ pub struct AreaConfigEntry {
 
 /// A redistribution entry as it appears in the config file.
 ///
-/// The actual schema uses `protocol: <name>` with optional `metric` and
-/// `metric_type` fields.
+/// The actual schema uses `protocol: <name>` with optional `metric`,
+/// `metric_type`, and `route_map` fields.
 #[derive(Debug, Default, Deserialize)]
 pub struct RedistributeEntry {
     pub protocol: String,
@@ -110,6 +119,11 @@ pub struct RedistributeEntry {
     pub metric: Option<u32>,
     #[serde(default)]
     pub metric_type: Option<u8>,
+    /// Optional reference (by name) to a top-level `route_maps:`
+    /// entry. The named map filters/transforms each candidate
+    /// prefix at LSA-origination time.
+    #[serde(default)]
+    pub route_map: Option<String>,
 }
 
 impl RedistributeEntry {
@@ -239,6 +253,11 @@ pub struct OspfDaemonConfig {
     /// whether the aggregate itself is emitted; component
     /// suppression happens regardless.
     pub summary_addresses: Vec<ParsedSummaryAddress>,
+    /// Compiled route-maps from the top-level `route_maps:` block,
+    /// keyed by name. Per-redistribute entries reference these by
+    /// name; the origination path looks them up to permit/deny
+    /// candidate prefixes.
+    pub route_maps: HashMap<String, RouteMap>,
 }
 
 /// A fully parsed summary-address entry, ready for origination.
@@ -296,13 +315,18 @@ pub enum AreaType {
 }
 
 /// Parsed redistribution configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedistributeConfig {
     pub source: RedistributeSource,
     /// Metric to advertise (default 20).
     pub metric: u32,
     /// E1 (1) or E2 (2). Default E2.
     pub metric_type: u8,
+    /// Optional name of a top-level route-map. Resolved at
+    /// LSA-origination time against `OspfDaemonConfig.route_maps`
+    /// (or `Ospf6DaemonConfig.route_maps`). A `None` here means
+    /// "permit every route from this protocol".
+    pub route_map: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +415,9 @@ pub struct Ospf6DaemonConfig {
     pub default_originate_metric_type: u8,
     /// Parsed summary-address entries.
     pub summary_addresses: Vec<ParsedSummaryAddress6>,
+    /// Compiled route-maps from the top-level `route_maps:` block,
+    /// keyed by name. Mirrors the v2 field.
+    pub route_maps: HashMap<String, RouteMap>,
 }
 
 impl Ospf6DaemonConfig {
@@ -424,6 +451,27 @@ pub struct Ospf6InterfaceConfig {
     /// populated and only meaningful when `network_type` is
     /// `"non-broadcast"`.
     pub static_neighbors: Vec<(Ipv6Addr, u8)>,
+}
+
+/// Compile every entry in the top-level `route_maps:` block into
+/// runtime form, keyed by name. Returns an error on duplicate
+/// names or unparseable clauses (bad CIDR, unknown source, etc.).
+fn compile_route_maps(
+    yaml: &[RouteMapYaml],
+) -> anyhow::Result<HashMap<String, RouteMap>> {
+    let mut out: HashMap<String, RouteMap> = HashMap::new();
+    for m in yaml {
+        let name = m.name.clone();
+        if out.contains_key(&name) {
+            anyhow::bail!("duplicate route-map name: {name}");
+        }
+        let compiled = m
+            .clone()
+            .compile()
+            .map_err(|e| anyhow::anyhow!("route-map {name}: {e}"))?;
+        out.insert(name, compiled);
+    }
+    Ok(out)
 }
 
 impl OspfDaemonConfig {
@@ -550,14 +598,27 @@ impl OspfDaemonConfig {
             }
         }
 
+        // Compile the top-level route_maps block once so both v4
+        // and v6 redistribute paths can resolve names against the
+        // same set.
+        let route_maps = compile_route_maps(&config.route_maps)?;
+
         // Parse redistribution entries
         let mut redistribute = Vec::new();
         for entry in &config.ospf.redistribute {
             if let Some(source) = RedistributeSource::parse(entry.source()) {
+                if let Some(name) = &entry.route_map {
+                    if !route_maps.contains_key(name) {
+                        anyhow::bail!(
+                            "redistribute references unknown route-map: {name}"
+                        );
+                    }
+                }
                 redistribute.push(RedistributeConfig {
                     source,
                     metric: entry.metric(),
                     metric_type: entry.metric_type(),
+                    route_map: entry.route_map.clone(),
                 });
             } else {
                 tracing::warn!(
@@ -605,6 +666,7 @@ impl OspfDaemonConfig {
                 .iter()
                 .filter_map(|e| parse_summary_v4(e))
                 .collect(),
+            route_maps,
         })
     }
 }
@@ -707,13 +769,23 @@ impl Ospf6DaemonConfig {
             });
         }
 
+        let route_maps = compile_route_maps(&config.route_maps)?;
+
         let mut redistribute = Vec::new();
         for entry in &config.ospf6.redistribute {
             if let Some(source) = RedistributeSource::parse(entry.source()) {
+                if let Some(name) = &entry.route_map {
+                    if !route_maps.contains_key(name) {
+                        anyhow::bail!(
+                            "ospf6 redistribute references unknown route-map: {name}"
+                        );
+                    }
+                }
                 redistribute.push(RedistributeConfig {
                     source,
                     metric: entry.metric(),
                     metric_type: entry.metric_type(),
+                    route_map: entry.route_map.clone(),
                 });
             } else {
                 tracing::warn!(
@@ -757,6 +829,7 @@ impl Ospf6DaemonConfig {
                 .iter()
                 .filter_map(|e| parse_summary_v6(e))
                 .collect(),
+            route_maps,
         }))
     }
 }

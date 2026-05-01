@@ -46,6 +46,11 @@ pub struct OspfInstance {
     /// to the `ospfd query status` CLI without plumbing the daemon
     /// config through to the query path.
     pub summary_addresses: Vec<crate::config::ParsedSummaryAddress>,
+    /// Compiled route-maps from the top-level `route_maps:` block,
+    /// keyed by name. `originate_external_lsas` resolves
+    /// per-redistribute `route_map` references against this set
+    /// when filtering candidate prefixes.
+    pub route_maps: std::collections::HashMap<String, ribd_routemap::RouteMap>,
 }
 
 impl OspfInstance {
@@ -143,6 +148,7 @@ impl OspfInstance {
             spf_max_holdtime_ms: config.spf_max_holdtime_ms,
             rib: OspfRib::new(),
             summary_addresses: config.summary_addresses.clone(),
+            route_maps: config.route_maps.clone(),
         }
     }
 
@@ -1449,6 +1455,24 @@ impl OspfInstance {
             return Vec::new();
         };
 
+        // Resolve the optional route-map by name. If the rule
+        // references a name we don't know, treat as deny-all
+        // (operator typo shouldn't silently leak routes).
+        let route_map = match &cfg.route_map {
+            None => None,
+            Some(name) => match self.route_maps.get(name) {
+                Some(m) => Some(m.clone()),
+                None => {
+                    tracing::warn!(
+                        route_map = %name,
+                        "redistribute references unknown route-map; treating as deny"
+                    );
+                    self.flush_self_externals_outside(&[]);
+                    return Vec::new();
+                }
+            },
+        };
+
         // Filter externals to those NOT covered by a configured
         // summary range. Components inside a summary are suppressed
         // regardless of the summary's no_advertise flag — that flag
@@ -1457,10 +1481,12 @@ impl OspfInstance {
         // behavior. Matches Cisco/Juniper semantics for
         // \`summary-address X.X.X.X/N\` and
         // \`summary-address X.X.X.X/N not-advertise\`.
+        // The route-map (if any) runs alongside summary suppression:
+        // a prefix must pass both the summary check and the map.
         let kept: Vec<(Ipv4Addr, Ipv4Addr)> = externals
             .iter()
             .copied()
-            .filter(|(prefix, _mask)| {
+            .filter(|(prefix, mask)| {
                 if let Some(s) = summaries
                     .iter()
                     .find(|s| prefix_covered_by(*prefix, s.prefix, s.prefix_len))
@@ -1470,10 +1496,21 @@ impl OspfInstance {
                         summary = %format!("{}/{}", s.prefix, s.prefix_len),
                         "suppressing component external — covered by summary range"
                     );
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                if let Some(rm) = &route_map {
+                    let len = mask_to_prefix_len_v4(*mask);
+                    let ribd_pfx = ribd_proto::Prefix::v4(*prefix, len);
+                    if !evaluate_route_map(rm, ribd_pfx, ribd_proto::Source::Connected) {
+                        tracing::debug!(
+                            prefix = %prefix,
+                            route_map = %rm.name,
+                            "route-map denied external"
+                        );
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
 
@@ -2235,6 +2272,47 @@ impl OspfInstance {
 }
 
 /// Convert prefix length to network mask.
+/// Convert a 4-octet network mask back into a CIDR prefix length.
+/// Counts leading 1-bits — the OSPF Type 5 wire encoding carries
+/// the mask, but the route-map evaluator wants a length.
+fn mask_to_prefix_len_v4(mask: Ipv4Addr) -> u8 {
+    u32::from(mask).leading_ones() as u8
+}
+
+/// Walk the statements of a compiled route-map and return whether
+/// the route is permitted. Universal-clause-only in v1; ospfd
+/// extras (`E = NoExtras`) are vacuously satisfied. No-statement-
+/// matched defaults to deny, matching FRR/Cisco semantics and the
+/// bgpd implementation in `bgpd::instance`. Shared with the v3
+/// origination path (`instance_v3.rs`) so both AFIs evaluate maps
+/// identically.
+pub(crate) fn evaluate_route_map(
+    map: &ribd_routemap::RouteMap,
+    prefix: ribd_proto::Prefix,
+    source: ribd_proto::Source,
+) -> bool {
+    struct Ctx {
+        prefix: ribd_proto::Prefix,
+        source: ribd_proto::Source,
+    }
+    impl ribd_routemap::MatchContext for Ctx {
+        fn prefix(&self) -> ribd_proto::Prefix {
+            self.prefix
+        }
+        fn source(&self) -> ribd_proto::Source {
+            self.source
+        }
+    }
+    let ctx = Ctx { prefix, source };
+    for stmt in &map.statements {
+        if !stmt.match_.evaluate_universal(&ctx) {
+            continue;
+        }
+        return matches!(stmt.action, ribd_routemap::Action::Permit);
+    }
+    false
+}
+
 fn prefix_len_to_mask(len: u8) -> Ipv4Addr {
     if len == 0 {
         return Ipv4Addr::UNSPECIFIED;
@@ -2310,6 +2388,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
 
         let instance = OspfInstance::new(&config);
@@ -2377,6 +2456,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
         let mut instance = OspfInstance::new(&config);
         instance.interfaces[0].state = InterfaceState::DR;
@@ -2530,6 +2610,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
         let mut instance = OspfInstance::new(&config);
         // Verify the network_type parsed correctly.
@@ -2608,6 +2689,7 @@ mod tests {
                 source: RedistributeSource::Connected,
                 metric: 20,
                 metric_type: 2,
+                route_map: None,
             }],
             areas: Vec::new(),
             distance: None,
@@ -2618,6 +2700,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
         let mut instance = OspfInstance::new(&config);
 
@@ -2759,6 +2842,7 @@ mod tests {
                 source: RedistributeSource::Connected,
                 metric: 20,
                 metric_type: 2,
+                route_map: None,
             }],
             areas: Vec::new(),
             distance: None,
@@ -2769,6 +2853,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
         let mut instance = OspfInstance::new(&config);
 
@@ -2835,6 +2920,7 @@ mod tests {
                 source: RedistributeSource::Connected,
                 metric: 20,
                 metric_type: 2,
+                route_map: None,
             }],
             areas: Vec::new(),
             distance: None,
@@ -2845,6 +2931,7 @@ mod tests {
             default_originate_metric: 1,
             default_originate_metric_type: 2,
             summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
         };
         let mut instance = OspfInstance::new(&config);
 
@@ -2920,5 +3007,142 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 0),
             8
         ));
+    }
+
+    fn compile_test_map(yaml: &str) -> ribd_routemap::RouteMap {
+        let parsed: ribd_routemap::RouteMapYaml = serde_yaml::from_str(yaml).unwrap();
+        parsed.compile().unwrap()
+    }
+
+    #[test]
+    fn route_map_filters_externals_in_originate() {
+        use crate::config::{
+            OspfDaemonConfig, RedistributeConfig, RedistributeSource,
+        };
+        // Map permits the /24 we care about; denies everything else.
+        let map = compile_test_map(
+            r#"
+name: edge-out
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["10.0.0.0/24"]
+  - seq: 20
+    action: deny
+"#,
+        );
+        let mut route_maps = std::collections::HashMap::new();
+        route_maps.insert("edge-out".to_string(), map);
+
+        let config = OspfDaemonConfig {
+            router_id: Ipv4Addr::new(1, 1, 1, 1),
+            reference_bandwidth: 100,
+            spf_delay_ms: 50,
+            spf_holdtime_ms: 200,
+            spf_max_holdtime_ms: 5000,
+            interfaces: Vec::new(),
+            redistribute: vec![RedistributeConfig {
+                source: RedistributeSource::Connected,
+                metric: 20,
+                metric_type: 2,
+                route_map: Some("edge-out".into()),
+            }],
+            areas: Vec::new(),
+            distance: None,
+            distance_intra: None,
+            distance_inter: None,
+            distance_external: None,
+            default_originate: false,
+            default_originate_metric: 1,
+            default_originate_metric_type: 2,
+            summary_addresses: Vec::new(),
+            route_maps,
+        };
+        let mut instance = OspfInstance::new(&config);
+
+        let externals = vec![
+            // Permitted by route-map.
+            (Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0)),
+            // Denied by the route-map (default-deny on no match).
+            (Ipv4Addr::new(192, 168, 1, 0), Ipv4Addr::new(255, 255, 255, 0)),
+        ];
+        let lsas = instance.originate_external_lsas(&config.redistribute, &externals, &[]);
+        // Only the permitted prefix should be originated.
+        assert_eq!(lsas.len(), 1);
+        assert_eq!(lsas[0].header.link_state_id, Ipv4Addr::new(10, 0, 0, 0));
+    }
+
+    #[test]
+    fn unknown_route_map_name_is_treated_as_deny() {
+        use crate::config::{
+            OspfDaemonConfig, RedistributeConfig, RedistributeSource,
+        };
+        let config = OspfDaemonConfig {
+            router_id: Ipv4Addr::new(1, 1, 1, 1),
+            reference_bandwidth: 100,
+            spf_delay_ms: 50,
+            spf_holdtime_ms: 200,
+            spf_max_holdtime_ms: 5000,
+            interfaces: Vec::new(),
+            redistribute: vec![RedistributeConfig {
+                source: RedistributeSource::Connected,
+                metric: 20,
+                metric_type: 2,
+                route_map: Some("does-not-exist".into()),
+            }],
+            areas: Vec::new(),
+            distance: None,
+            distance_intra: None,
+            distance_inter: None,
+            distance_external: None,
+            default_originate: false,
+            default_originate_metric: 1,
+            default_originate_metric_type: 2,
+            summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
+        };
+        let mut instance = OspfInstance::new(&config);
+        let externals = vec![(
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let lsas = instance.originate_external_lsas(&config.redistribute, &externals, &[]);
+        assert!(lsas.is_empty());
+    }
+
+    #[test]
+    fn evaluate_route_map_default_deny_on_no_match() {
+        let map = compile_test_map(
+            r#"
+name: only-23
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["23.0.0.0/8"]
+"#,
+        );
+        let inside = ribd_proto::Prefix::v4(Ipv4Addr::new(23, 1, 0, 0), 8);
+        let outside = ribd_proto::Prefix::v4(Ipv4Addr::new(10, 0, 0, 0), 8);
+        assert!(evaluate_route_map(&map, inside, ribd_proto::Source::Connected));
+        assert!(!evaluate_route_map(&map, outside, ribd_proto::Source::Connected));
+    }
+
+    #[test]
+    fn mask_to_prefix_len_basic() {
+        assert_eq!(
+            mask_to_prefix_len_v4(Ipv4Addr::new(255, 255, 255, 0)),
+            24
+        );
+        assert_eq!(
+            mask_to_prefix_len_v4(Ipv4Addr::new(255, 0, 0, 0)),
+            8
+        );
+        assert_eq!(mask_to_prefix_len_v4(Ipv4Addr::UNSPECIFIED), 0);
+        assert_eq!(
+            mask_to_prefix_len_v4(Ipv4Addr::new(255, 255, 255, 255)),
+            32
+        );
     }
 }

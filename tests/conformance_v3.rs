@@ -556,7 +556,12 @@ fn asbr_v3_1_e_flag_and_type5_origination() {
         Vec::new(),
     );
     inst.set_asbr(true);
-    inst.redistribute = vec![(ospfd::config::RedistributeSource::Connected, 20, 2)];
+    inst.redistribute = vec![ospfd::config::RedistributeConfig {
+        source: ospfd::config::RedistributeSource::Connected,
+        metric: 20,
+        metric_type: 2,
+        route_map: None,
+    }];
 
     inst.originate_router_lsa();
     inst.originate_external_lsas(vec![(v6("2001:db8:ff::"), 64)], &[]);

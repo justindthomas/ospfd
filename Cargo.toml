@@ -10,6 +10,7 @@ authors = ["Justin Thomas"]
 vpp-api = { git = "https://github.com/justindthomas/vpp-api" }
 ribd-proto = { git = "https://github.com/justindthomas/ribd" }
 ribd-client = { git = "https://github.com/justindthomas/ribd" }
+ribd-routemap = { git = "https://github.com/justindthomas/ribd" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -38,3 +39,4 @@ vpp-api = { path = "../vpp-api" }
 [patch."https://github.com/justindthomas/ribd"]
 ribd-proto = { path = "../ribd/ribd-proto" }
 ribd-client = { path = "../ribd/ribd-client" }
+ribd-routemap = { path = "../ribd/ribd-routemap" }

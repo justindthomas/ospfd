@@ -950,20 +950,12 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                         (a.area_id, at)
                     })
                     .collect();
-                let redistribute: Vec<(
-                    ospfd::config::RedistributeSource,
-                    u32,
-                    u8,
-                )> = v3_config
-                    .redistribute
-                    .iter()
-                    .map(|r| (r.source, r.metric, r.metric_type))
-                    .collect();
                 let v3_cfg = daemon_v3::V3DaemonConfig {
                     router_id: v3_config.router_id,
                     interfaces: v3_ifaces,
                     areas,
-                    redistribute,
+                    redistribute: v3_config.redistribute.clone(),
+                    route_maps: v3_config.route_maps.clone(),
                     distance: v3_config.distance,
                     default_originate: v3_config.default_originate,
                     default_originate_metric: v3_config.default_originate_metric,

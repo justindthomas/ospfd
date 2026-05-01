@@ -164,8 +164,14 @@ pub struct InstanceV3 {
     /// protocol into OSPFv3 (set by daemon from config).
     pub asbr: bool,
     /// Configured redistribute sources (carried for Type 5
-    /// origination). Each entry is (source, metric, metric_type).
-    pub redistribute: Vec<(crate::config::RedistributeSource, u32, u8)>,
+    /// origination). Each entry carries source / metric /
+    /// metric-type and (optionally) a route-map name resolved
+    /// against [`route_maps`] at origination time.
+    pub redistribute: Vec<crate::config::RedistributeConfig>,
+    /// Compiled route-maps from the top-level `route_maps:` block,
+    /// keyed by name. `originate_external_lsas` resolves
+    /// per-redistribute `route_map` references against this set.
+    pub route_maps: HashMap<String, ribd_routemap::RouteMap>,
     /// Configured summary-address aggregates. Surfaced through the
     /// control socket's Status6 reply so the `ospfd query
     /// status6` CLI can show what was configured.
@@ -181,6 +187,7 @@ impl InstanceV3 {
             area_types: HashMap::new(),
             asbr: false,
             redistribute: Vec::new(),
+            route_maps: HashMap::new(),
             summary_addresses: Vec::new(),
         }
     }
@@ -342,18 +349,8 @@ impl InstanceV3 {
         }
 
         // redistribute — replace wholesale; update derived ASBR flag.
-        let new_redist: Vec<_> = new
-            .redistribute
-            .iter()
-            .map(|r| (r.source, r.metric, r.metric_type))
-            .collect();
-        if self.redistribute.len() != new_redist.len()
-            || self
-                .redistribute
-                .iter()
-                .zip(new_redist.iter())
-                .any(|(a, b)| a != b)
-        {
+        let new_redist = new.redistribute.clone();
+        if self.redistribute != new_redist {
             tracing::info!(
                 old = self.redistribute.len(),
                 new = new_redist.len(),
@@ -363,6 +360,10 @@ impl InstanceV3 {
             self.asbr = !self.redistribute.is_empty();
             changed = true;
         }
+        // route_maps — replace wholesale. We don't try to diff
+        // statement-by-statement (RouteMap doesn't impl PartialEq);
+        // the next origination cycle picks up the new set.
+        self.route_maps = new.route_maps.clone();
 
         // summary_addresses — replace wholesale. Origination happens
         // on the next SPF / periodic origination cycle.
@@ -1538,24 +1539,43 @@ impl InstanceV3 {
             self.flush_self_externals_outside(&[]);
             return;
         }
-        let Some((_, metric, metric_type)) = self
+        let Some(cfg) = self
             .redistribute
             .iter()
-            .find(|(s, _, _)| *s == crate::config::RedistributeSource::Connected)
-            .copied()
+            .find(|r| r.source == crate::config::RedistributeSource::Connected)
+            .cloned()
         else {
             self.flush_self_externals_outside(&[]);
             return;
+        };
+        let metric = cfg.metric;
+        let metric_type = cfg.metric_type;
+        // Resolve the rule's optional route-map. Unknown name →
+        // deny everything (operator typo shouldn't silently leak).
+        let route_map = match &cfg.route_map {
+            None => None,
+            Some(name) => match self.route_maps.get(name) {
+                Some(m) => Some(m.clone()),
+                None => {
+                    tracing::warn!(
+                        route_map = %name,
+                        "ospf6 redistribute references unknown route-map; treating as deny"
+                    );
+                    self.flush_self_externals_outside(&[]);
+                    return;
+                }
+            },
         };
 
         // Filter out components covered by a configured summary
         // range. The aggregate itself is emitted by
         // originate_summary_address_lsas at a separate link-state-id;
         // no_advertise on the summary suppresses the aggregate but
-        // does not change component-suppression behavior.
+        // does not change component-suppression behavior. The
+        // route-map (if any) runs in series with summary suppression.
         let kept: Vec<(Ipv6Addr, u8)> = externals
             .into_iter()
-            .filter(|(addr, _len)| {
+            .filter(|(addr, len)| {
                 if let Some(s) = summaries
                     .iter()
                     .find(|s| prefix_covered_by_v6(*addr, s.prefix, s.prefix_len))
@@ -1565,10 +1585,24 @@ impl InstanceV3 {
                         summary = %format!("{}/{}", s.prefix, s.prefix_len),
                         "OSPFv3 suppressing component external — covered by summary range"
                     );
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                if let Some(rm) = &route_map {
+                    let pfx = ribd_proto::Prefix::v6(*addr, *len);
+                    if !crate::instance::evaluate_route_map(
+                        rm,
+                        pfx,
+                        ribd_proto::Source::Connected,
+                    ) {
+                        tracing::debug!(
+                            prefix = %addr,
+                            route_map = %rm.name,
+                            "OSPFv3 route-map denied external"
+                        );
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
 
@@ -2690,7 +2724,12 @@ mod tests {
             Vec::new(),
         );
         inst.set_asbr(true);
-        inst.redistribute = vec![(crate::config::RedistributeSource::Connected, 20, 2)];
+        inst.redistribute = vec![crate::config::RedistributeConfig {
+            source: crate::config::RedistributeSource::Connected,
+            metric: 20,
+            metric_type: 2,
+            route_map: None,
+        }];
 
         let externals = vec![
             ("2001:db8:1::".parse::<Ipv6Addr>().unwrap(), 64u8),
@@ -2765,7 +2804,12 @@ mod tests {
             Vec::new(),
         );
         inst.set_asbr(true);
-        inst.redistribute = vec![(crate::config::RedistributeSource::Connected, 20, 2)];
+        inst.redistribute = vec![crate::config::RedistributeConfig {
+            source: crate::config::RedistributeSource::Connected,
+            metric: 20,
+            metric_type: 2,
+            route_map: None,
+        }];
 
         // Originate three externals, then shrink to one.
         let three = vec![
@@ -2986,7 +3030,12 @@ mod tests {
             Vec::new(),
         );
         inst.set_asbr(true);
-        inst.redistribute = vec![(crate::config::RedistributeSource::Connected, 20, 2)];
+        inst.redistribute = vec![crate::config::RedistributeConfig {
+            source: crate::config::RedistributeSource::Connected,
+            metric: 20,
+            metric_type: 2,
+            route_map: None,
+        }];
 
         let summaries = vec![ParsedSummaryAddress6 {
             prefix: "2001:db8::".parse().unwrap(),

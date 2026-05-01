@@ -61,10 +61,16 @@ pub struct V3DaemonConfig {
     /// Per-area type (Normal / Stub / NSSA). Used to gate Type 5
     /// AS-External LSA flooding and Type 7 NSSA-LSA scope.
     pub areas: Vec<(std::net::Ipv4Addr, crate::area::AreaType)>,
-    /// Redistribute sources (source, metric, metric_type). A non-empty
-    /// list makes us an ASBR: the E flag is set in our Router-LSA and
-    /// Type 5 AS-External-LSAs are originated for matching prefixes.
-    pub redistribute: Vec<(crate::config::RedistributeSource, u32, u8)>,
+    /// Redistribute rules. A non-empty list makes us an ASBR: the E
+    /// flag is set in our Router-LSA and Type 5 AS-External-LSAs
+    /// are originated for matching prefixes. Each rule may carry an
+    /// optional `route_map` name resolved against [`route_maps`].
+    pub redistribute: Vec<crate::config::RedistributeConfig>,
+    /// Compiled route-maps from the top-level `route_maps:` block,
+    /// keyed by name. Forwarded into `InstanceV3` for use at
+    /// origination time.
+    pub route_maps:
+        std::collections::HashMap<String, ribd_routemap::RouteMap>,
     /// Admin-distance override applied to all v3 route sub-types.
     /// `None` keeps the ribd default (110).
     pub distance: Option<u8>,
@@ -158,6 +164,7 @@ pub async fn run(
     {
         let mut inst = instance.lock().await;
         inst.redistribute = cfg.redistribute.clone();
+        inst.route_maps = cfg.route_maps.clone();
         inst.set_asbr(!cfg.redistribute.is_empty());
         for (area_id, area_type) in &cfg.areas {
             inst.set_area_type(*area_id, *area_type);
