@@ -648,10 +648,34 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         "OSPF configuration loaded"
     );
 
-    // Connect to VPP
+    // Connect to VPP via the supervisor — survives VPP being slow to
+    // come up at boot. After we have a live client we hand it off to
+    // the rest of init (raw sockets / punt registrations are bound to
+    // the current connection's sw_if_index values, so the simplest
+    // robust recovery on VPP restart is to exit and let systemd
+    // restart us — the lifecycle watcher below does that).
     tracing::info!(socket = %args.vpp_api_socket, "connecting to VPP");
-    let vpp = vpp_api::VppClient::connect(&args.vpp_api_socket).await?;
+    let vpp_supervisor = vpp_api::VppSupervisor::spawn(args.vpp_api_socket.clone());
+    let vpp = vpp_supervisor.wait_ready().await;
     tracing::info!(client_index = vpp.client_index(), "connected to VPP");
+
+    // Watch for VPP disconnects. On disconnect we log a clear
+    // warning and exit — every component below this point holds
+    // VPP-bound state (raw sockets per sw_if_index, punt
+    // registrations, neighbor LSDB references to interfaces) that
+    // would all need rebuilding from scratch. systemd's restart will
+    // do that with one less moving piece than a hot rebuild.
+    {
+        let mut lifecycle = vpp_supervisor.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = lifecycle.recv().await {
+                if matches!(ev, vpp_api::VppLifecycle::Disconnected) {
+                    tracing::error!("VPP connection lost — exiting so systemd restarts ospfd");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 
     // Resolve interface sw_if_index values from VPP
     let vpp_interfaces = vpp
@@ -978,14 +1002,32 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     // Dedicated VPP connection so v3 doesn't share
                     // request/reply context with the v2 client.
-                    let v3_vpp = match vpp_api::VppClient::connect(&v3_vpp_socket).await {
+                    // Same supervisor pattern as v2 — wait for the
+                    // first connection, then run. If this connection
+                    // dies the v2 lifecycle watcher (which observes
+                    // both processes share VPP) will exit() the
+                    // daemon as a whole.
+                    let v3_super = vpp_api::VppSupervisor::spawn(v3_vpp_socket);
+                    let v3_vpp = v3_super.wait_ready().await;
+                    // run() needs an owned VppClient; clone-out via
+                    // Arc isn't sufficient. Reconnect under the v3
+                    // path stays as exit-and-restart for now (the
+                    // outer lifecycle watcher handles that).
+                    let owned = match std::sync::Arc::try_unwrap(v3_vpp) {
                         Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!("OSPFv3 VPP connect failed: {}", e);
-                            return;
+                        Err(arc) => {
+                            tracing::warn!("v3: VppClient still shared, falling back to direct connect");
+                            drop(arc);
+                            match vpp_api::VppClient::connect(v3_super.socket_path()).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!("OSPFv3 VPP connect failed: {}", e);
+                                    return;
+                                }
+                            }
                         }
                     };
-                    if let Err(e) = daemon_v3::run(v3_cfg, v3_vpp, v3_inst).await {
+                    if let Err(e) = daemon_v3::run(v3_cfg, owned, v3_inst).await {
                         tracing::error!("OSPFv3 daemon exited: {}", e);
                     }
                 });
