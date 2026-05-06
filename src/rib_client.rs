@@ -199,6 +199,10 @@ fn spf_route_to_proto(r: &SpfRoute, source: Source) -> Route {
         metric: r.cost,
         tag: 0,
         admin_distance: None,
+        // OSPF instance is single-VRF for now (Phase 1). Per-VRF
+        // OSPF instances arrive in Phase 2; each instance will
+        // stamp its routes with its operator-assigned table-id.
+        table_id: 0,
     }
 }
 
@@ -215,6 +219,7 @@ fn ospfv3_route_to_proto(r: &Ospfv3Route, source: Source) -> Route {
         metric: r.cost,
         tag: 0,
         admin_distance: None,
+        table_id: 0,
     }
 }
 
