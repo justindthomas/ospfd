@@ -80,7 +80,12 @@ impl RawSocketIoV3 {
             let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_raw) };
             unsafe {
                 let flags = libc::fcntl(reader_fd.as_raw_fd(), libc::F_GETFL, 0);
-                libc::fcntl(reader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(reader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
 
             let async_fd = AsyncFd::new(reader_fd)?;
