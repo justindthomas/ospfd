@@ -15,6 +15,8 @@ use md5::{Digest, Md5};
 use sha2::{Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
 
+use super::OSPF_HEADER_LEN;
+
 /// OSPF Authentication Type (RFC 2328 Appendix D.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -227,7 +229,7 @@ pub fn apply_auth(packet: Vec<u8>, key: &AuthKey, sequence: u32) -> Vec<u8> {
 /// All digest comparisons are constant-time to avoid timing oracles on the
 /// authentication tag.
 pub fn verify_auth(packet: &[u8], key: &AuthKey) -> bool {
-    if packet.len() < 24 {
+    if packet.len() < OSPF_HEADER_LEN {
         return false;
     }
     let pkt_au_type = u16::from_be_bytes([packet[14], packet[15]]);
@@ -255,8 +257,12 @@ pub fn verify_auth(packet: &[u8], key: &AuthKey) -> bool {
             }
             // The packet length in the header already accounts for the body
             // WITHOUT the digest. The digest is appended after.
+            // pkt_len must cover at least the OSPF header — otherwise the
+            // MAC would be computed over fewer bytes than the header itself,
+            // breaking the invariant that a successful verify authenticates
+            // the full 24-byte header.
             let pkt_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-            if packet.len() < pkt_len + 16 {
+            if pkt_len < OSPF_HEADER_LEN || packet.len() < pkt_len + 16 {
                 return false;
             }
             let (header_and_body, digest_bytes) = packet.split_at(pkt_len);
@@ -281,8 +287,10 @@ pub fn verify_auth(packet: &[u8], key: &AuthKey) -> bool {
             if packet[19] as usize != trailer_len {
                 return false;
             }
+            // Same minimum-length invariant as the MD5 path: pkt_len must
+            // cover the OSPF header for the MAC to authenticate it.
             let pkt_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-            if packet.len() < pkt_len + trailer_len {
+            if pkt_len < OSPF_HEADER_LEN || packet.len() < pkt_len + trailer_len {
                 return false;
             }
             let (header_and_body, trailer_bytes) = packet.split_at(pkt_len);
@@ -513,5 +521,47 @@ mod tests {
         };
         // auth_data_length on the wire is 16, sha256 expects 32 → reject.
         assert!(!verify_auth(&md5_authed, &sha_key));
+    }
+
+    /// Regression for F9: a Crypto-authed packet whose header `pkt_len`
+    /// is below the 24-byte OSPF header length must be rejected. Without
+    /// the guard, the MAC would be computed over fewer bytes than the
+    /// header, leaving header fields unauthenticated even on success.
+    #[test]
+    fn verify_auth_rejects_pkt_len_below_header() {
+        // Build a real MD5-authed packet, then forge pkt_len = 0 in the
+        // header. The receiver must reject without computing the MAC.
+        let packet = build_ospf_packet(48);
+        let key = AuthKey::Md5 {
+            key_id: 1,
+            key: b"key".to_vec(),
+        };
+        let mut authed = apply_auth(packet, &key, 1);
+        authed[2] = 0;
+        authed[3] = 0;
+        assert!(!verify_auth(&authed, &key));
+
+        // Same forgery against the HMAC-SHA path.
+        let packet = build_ospf_packet(48);
+        let key = AuthKey::HmacSha {
+            algo: HmacAlgo::Sha256,
+            key_id: 1,
+            key: b"key".to_vec(),
+        };
+        let mut authed = apply_auth(packet, &key, 1);
+        authed[2] = 0;
+        authed[3] = 0;
+        assert!(!verify_auth(&authed, &key));
+
+        // pkt_len just below the OSPF header length is also rejected.
+        let packet = build_ospf_packet(48);
+        let key = AuthKey::Md5 {
+            key_id: 1,
+            key: b"key".to_vec(),
+        };
+        let mut authed = apply_auth(packet, &key, 1);
+        authed[2] = 0;
+        authed[3] = 23;
+        assert!(!verify_auth(&authed, &key));
     }
 }
