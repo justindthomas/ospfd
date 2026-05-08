@@ -38,6 +38,16 @@ pub const LSA_V3_HEADER_LEN: usize = 20;
 pub const MAX_AGE: u16 = 3600;
 pub const INITIAL_SEQUENCE_NUMBER: i32 = -0x7FFF_FFFF; // 0x80000001
 
+/// Compute an OSPFv3 LSA's total wire length (header + body) as a u16.
+///
+/// Panics if the total exceeds `u16::MAX` — by spec LSA bodies are well
+/// under 64 KB, so a panic here is a bug.
+#[inline]
+pub fn lsa_v3_total_length(body_len: usize) -> u16 {
+    u16::try_from(LSA_V3_HEADER_LEN + body_len)
+        .expect("OSPFv3 LSA length exceeds u16::MAX — body too large for wire format")
+}
+
 /// OSPFv3 LSA function codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]

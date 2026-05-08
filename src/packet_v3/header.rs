@@ -31,6 +31,16 @@ use super::PacketV3Error;
 pub const OSPFV3_HEADER_LEN: usize = 16;
 pub const OSPFV3_VERSION: u8 = 3;
 
+/// Compute an OSPFv3 packet's total wire length (header + body) as a u16.
+///
+/// Panics if the total exceeds `u16::MAX`, which would be a bug — OSPF
+/// packets are bounded well below 64 KB by interface MTU.
+#[inline]
+pub fn ospfv3_total_length(body_len: usize) -> u16 {
+    u16::try_from(OSPFV3_HEADER_LEN + body_len)
+        .expect("OSPFv3 packet length exceeds u16::MAX — body too large for wire format")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Ospfv3PacketType {

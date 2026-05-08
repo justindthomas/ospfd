@@ -50,6 +50,18 @@ impl LsaType {
 /// ```
 pub const LSA_HEADER_LEN: usize = 20;
 
+/// Compute an LSA's total wire length (header + body) as a u16.
+///
+/// The wire-format `length` field is 16-bit, so a body that pushes the
+/// total over `u16::MAX` cannot be represented and would silently
+/// truncate under `as u16`. This helper panics on overflow — by spec
+/// LSA bodies are well under 64 KB, so hitting this is a bug.
+#[inline]
+pub fn lsa_total_length(body_len: usize) -> u16 {
+    u16::try_from(LSA_HEADER_LEN + body_len)
+        .expect("LSA length exceeds u16::MAX — body too large for OSPF wire format")
+}
+
 /// Maximum age of an LSA in seconds.
 pub const MAX_AGE: u16 = 3600;
 

@@ -1172,7 +1172,7 @@ impl OspfInstance {
             };
             let mut body_buf = Vec::new();
             body.encode(&mut body_buf);
-            let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+            let length = lsa_total_length(body_buf.len());
 
             let lsa = Lsa {
                 header: LsaHeader {
@@ -1325,7 +1325,7 @@ impl OspfInstance {
             };
             let mut body_buf = Vec::new();
             body.encode(&mut body_buf);
-            let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+            let length = lsa_total_length(body_buf.len());
             let lsa = Lsa {
                 header: LsaHeader {
                     ls_age: 0,
@@ -1383,7 +1383,7 @@ impl OspfInstance {
 
                     let mut body_buf = Vec::new();
                     body.encode(&mut body_buf);
-                    let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+                    let length = lsa_total_length(body_buf.len());
 
                     let key = LsaKey {
                         ls_type: LsaType::SummaryNetwork,
@@ -1549,7 +1549,7 @@ impl OspfInstance {
 
             let mut body_buf = Vec::new();
             body.encode(&mut body_buf);
-            let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+            let length = lsa_total_length(body_buf.len());
 
             let lsa = Lsa {
                 header: LsaHeader {
@@ -1652,7 +1652,7 @@ impl OspfInstance {
             };
             let mut body_buf = Vec::new();
             body.encode(&mut body_buf);
-            let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+            let length = lsa_total_length(body_buf.len());
             let lsa = Lsa {
                 header: LsaHeader {
                     ls_age: 0,
@@ -1699,7 +1699,7 @@ impl OspfInstance {
         };
         let mut body_buf = Vec::new();
         body.encode(&mut body_buf);
-        let length = (LSA_HEADER_LEN + body_buf.len()) as u16;
+        let length = lsa_total_length(body_buf.len());
         let lsa = Lsa {
             header: LsaHeader {
                 ls_age: 0,

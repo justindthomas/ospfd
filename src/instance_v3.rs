@@ -16,10 +16,10 @@ use crate::lsdb_v3::{LsaEntryV3, LsdbV3};
 use crate::packet::checksum::fletcher16;
 use crate::packet_v3::dd::{DbDescV3Packet, DD_V3_FLAG_I, DD_V3_FLAG_M, DD_V3_FLAG_MS};
 use crate::packet_v3::hello::{HelloV3Packet, Options, HELLO_V3_MIN_LEN};
-use crate::packet_v3::header::{Ospfv3Header, Ospfv3PacketType, OSPFV3_HEADER_LEN};
+use crate::packet_v3::header::{ospfv3_total_length, Ospfv3Header, Ospfv3PacketType, OSPFV3_HEADER_LEN};
 use crate::packet_v3::lsa::{
-    IntraAreaPrefixLsaV3, LinkLsaV3, LsaV3Header, LsaV3Type, NetworkLsaV3, RouterLinkV3,
-    RouterLsaV3, INITIAL_SEQUENCE_NUMBER, LSA_V3_HEADER_LEN,
+    lsa_v3_total_length, IntraAreaPrefixLsaV3, LinkLsaV3, LsaV3Header, LsaV3Type, NetworkLsaV3,
+    RouterLinkV3, RouterLsaV3, INITIAL_SEQUENCE_NUMBER, LSA_V3_HEADER_LEN,
 };
 use crate::packet_v3::prefix::Ospfv3Prefix;
 use crate::packet_v3::lsack::LsAckV3Packet;
@@ -506,7 +506,7 @@ impl InstanceV3 {
         hello.encode(&mut body);
 
         let mut hdr = Ospfv3Header::new(Ospfv3PacketType::Hello, router_id, iface.area_id);
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         hdr.instance_id = iface.instance_id;
 
         let mut buf = Vec::with_capacity(hdr.packet_length as usize);
@@ -1341,7 +1341,7 @@ impl InstanceV3 {
                 advertising_router: router_id,
                 ls_sequence_number: INITIAL_SEQUENCE_NUMBER,
                 ls_checksum: 0,
-                length: (LSA_V3_HEADER_LEN + body.len()) as u16,
+                length: lsa_v3_total_length(body.len()),
             };
             let area = Some(area_id);
             // Bump sequence if existing.
@@ -1867,7 +1867,7 @@ impl InstanceV3 {
             advertising_router: router_id,
             ls_sequence_number: INITIAL_SEQUENCE_NUMBER,
             ls_checksum: 0,
-            length: (LSA_V3_HEADER_LEN + body.len()) as u16,
+            length: lsa_v3_total_length(body.len()),
         };
         if let Some(existing) = self.lsdb.get(&crate::lsdb_v3::LsaKeyV3 {
             area,
@@ -2031,7 +2031,7 @@ impl InstanceV3 {
             advertising_router: router_id,
             ls_sequence_number: INITIAL_SEQUENCE_NUMBER,
             ls_checksum: 0,
-            length: (LSA_V3_HEADER_LEN + body.len()) as u16,
+            length: lsa_v3_total_length(body.len()),
         };
         if let Some(existing) = self.lsdb.get(&crate::lsdb_v3::LsaKeyV3 {
             area,
@@ -2165,7 +2165,7 @@ impl InstanceV3 {
         dst_addr: Ipv6Addr,
     ) -> TxPacketV3 {
         let mut hdr = Ospfv3Header::new(packet_type, router_id, area_id);
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         hdr.instance_id = instance_id;
         let mut buf = Vec::with_capacity(hdr.packet_length as usize);
         hdr.encode(&mut buf);
@@ -2303,7 +2303,7 @@ impl InstanceV3 {
             router_id,
             area_id,
         );
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         hdr.instance_id = instance_id;
 
         let mut buf = Vec::with_capacity(hdr.packet_length as usize);
@@ -3155,7 +3155,7 @@ mod tests {
             Ipv4Addr::new(2, 2, 2, 2),
             Ipv4Addr::UNSPECIFIED,
         );
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         let mut data = Vec::new();
         hdr.encode(&mut data);
         data.extend_from_slice(&body);
@@ -3231,7 +3231,7 @@ mod tests {
             Ipv4Addr::new(2, 2, 2, 2),
             Ipv4Addr::UNSPECIFIED,
         );
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         let mut data = Vec::new();
         hdr.encode(&mut data);
         data.extend_from_slice(&body);
@@ -3303,7 +3303,7 @@ mod tests {
             advertising_router: Ipv4Addr::new(2, 2, 2, 2),
             ls_sequence_number: INITIAL_SEQUENCE_NUMBER,
             ls_checksum: 0,
-            length: (LSA_V3_HEADER_LEN + body.len()) as u16,
+            length: lsa_v3_total_length(body.len()),
         };
         let mut raw = Vec::new();
         header.encode(&mut raw);
@@ -3366,7 +3366,7 @@ mod tests {
             src_rid,
             Ipv4Addr::UNSPECIFIED,
         );
-        hdr.packet_length = (OSPFV3_HEADER_LEN + body.len()) as u16;
+        hdr.packet_length = ospfv3_total_length(body.len());
         let mut buf = Vec::new();
         hdr.encode(&mut buf);
         buf.extend_from_slice(&body);
