@@ -2358,6 +2358,8 @@ mod tests {
     #[test]
     fn test_build_hello() {
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -2425,6 +2427,8 @@ mod tests {
         use crate::packet::OspfHeader;
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             // High router-id — we'll be master.
             router_id: Ipv4Addr::new(10, 0, 0, 2),
             reference_bandwidth: 100,
@@ -2580,6 +2584,8 @@ mod tests {
         use crate::proto::neighbor::{Neighbor, NeighborState};
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -2665,6 +2671,8 @@ mod tests {
         use crate::config::{RedistributeConfig, RedistributeSource};
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(2, 2, 2, 2),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -2832,6 +2840,8 @@ mod tests {
         use crate::config::{RedistributeConfig, RedistributeSource};
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -2910,6 +2920,8 @@ mod tests {
         };
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -3036,6 +3048,8 @@ statements:
         route_maps.insert("edge-out".to_string(), map);
 
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,
@@ -3079,6 +3093,8 @@ statements:
             OspfDaemonConfig, RedistributeConfig, RedistributeSource,
         };
         let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             reference_bandwidth: 100,
             spf_delay_ms: 50,

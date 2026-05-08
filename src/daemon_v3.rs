@@ -56,6 +56,11 @@ pub struct V3InterfaceConfig {
 
 #[derive(Debug, Clone)]
 pub struct V3DaemonConfig {
+    /// VRF identity for the per-instance log + RibClient name. None
+    /// for default-VRF; Some("customer_vrf") for `imp-ospfd@customer_vrf`.
+    pub vrf_name: Option<String>,
+    /// IPv6 FIB table-id stamped on every Route pushed to ribd.
+    pub table_id_v6: u32,
     pub router_id: std::net::Ipv4Addr,
     pub interfaces: Vec<V3InterfaceConfig>,
     /// Per-area type (Normal / Stub / NSSA). Used to gate Type 5
@@ -275,8 +280,15 @@ pub async fn run(
     let mut last_neighbor_count = 0usize;
 
     // Connect to ribd. v3 uses its own RibClient so its
-    // connection lifecycle is independent from v2.
-    let mut rib_client = RibClient::new("/run/ribd.sock", "ospfd-v3");
+    // connection lifecycle is independent from v2. Stamp the
+    // configured `table_id_v6` so per-VRF instances install routes
+    // into their own FIB.
+    let v3_client_name = match &cfg.vrf_name {
+        None => "ospfd-v3".to_string(),
+        Some(v) => format!("ospfd-v3@{v}"),
+    };
+    let mut rib_client = RibClient::new("/run/ribd.sock", v3_client_name)
+        .with_table_ids(0, cfg.table_id_v6);
     if let Err(e) = rib_client.connect(Duration::from_secs(10)).await {
         tracing::warn!(
             "ribd connect (v3) failed at startup: {} — will retry on next push",

@@ -26,6 +26,13 @@ pub struct RibClient {
     socket_path: PathBuf,
     client_name: String,
     conn: Option<RibConnection>,
+    /// FIB table-id stamped onto every v4 Route pushed to ribd.
+    /// Default-VRF instances leave this at 0; per-VRF instances
+    /// stamp their VRF's `table_id_v4` (or `table_id_v6` for the
+    /// v6 client). ribd partitions routes by table_id when it
+    /// programs VPP and the kernel.
+    table_id_v4: u32,
+    table_id_v6: u32,
 }
 
 impl RibClient {
@@ -37,7 +44,18 @@ impl RibClient {
             socket_path: socket_path.into(),
             client_name: client_name.into(),
             conn: None,
+            table_id_v4: 0,
+            table_id_v6: 0,
         }
+    }
+
+    /// Stamp the table-ids that get applied to every Route pushed
+    /// to ribd. Mutating builder so the caller can chain at
+    /// construction time.
+    pub fn with_table_ids(mut self, v4: u32, v6: u32) -> Self {
+        self.table_id_v4 = v4;
+        self.table_id_v6 = v6;
+        self
     }
 
     /// Connect with bounded retry. On success, subsequent push_bulk
@@ -80,7 +98,7 @@ impl RibClient {
                 OspfRouteKind::External1 => Source::OspfExt1,
                 OspfRouteKind::External2 => Source::OspfExt2,
             };
-            let mut proto = spf_route_to_proto(r, source);
+            let mut proto = spf_route_to_proto(r, source, self.table_id_v4);
             proto.admin_distance = ad_override(r.kind);
             match r.kind {
                 OspfRouteKind::Intra => intra.push(proto),
@@ -113,7 +131,7 @@ impl RibClient {
                 Ospfv3RouteKind::External1 => Source::Ospf6Ext1,
                 Ospfv3RouteKind::External2 => Source::Ospf6Ext2,
             };
-            let mut proto = ospfv3_route_to_proto(r, source);
+            let mut proto = ospfv3_route_to_proto(r, source, self.table_id_v6);
             proto.admin_distance = ad_override(r.kind);
             match r.kind {
                 Ospfv3RouteKind::Intra => intra.push(proto),
@@ -191,7 +209,7 @@ impl RibClient {
     }
 }
 
-fn spf_route_to_proto(r: &SpfRoute, source: Source) -> Route {
+fn spf_route_to_proto(r: &SpfRoute, source: Source, table_id: u32) -> Route {
     Route {
         prefix: Prefix::v4(r.prefix, r.prefix_len),
         source,
@@ -199,14 +217,11 @@ fn spf_route_to_proto(r: &SpfRoute, source: Source) -> Route {
         metric: r.cost,
         tag: 0,
         admin_distance: None,
-        // OSPF instance is single-VRF for now (Phase 1). Per-VRF
-        // OSPF instances arrive in Phase 2; each instance will
-        // stamp its routes with its operator-assigned table-id.
-        table_id: 0,
+        table_id,
     }
 }
 
-fn ospfv3_route_to_proto(r: &Ospfv3Route, source: Source) -> Route {
+fn ospfv3_route_to_proto(r: &Ospfv3Route, source: Source, table_id: u32) -> Route {
     let next_hops = r
         .next_hops
         .iter()
@@ -219,7 +234,7 @@ fn ospfv3_route_to_proto(r: &Ospfv3Route, source: Source) -> Route {
         metric: r.cost,
         tag: 0,
         admin_distance: None,
-        table_id: 0,
+        table_id,
     }
 }
 
@@ -241,9 +256,10 @@ mod tests {
             sw_if_index: 1,
             kind: OspfRouteKind::Intra,
         };
-        let p = spf_route_to_proto(&r, Source::OspfIntra);
+        let p = spf_route_to_proto(&r, Source::OspfIntra, 10);
         assert_eq!(p.source, Source::OspfIntra);
         assert_eq!(p.metric, 10);
+        assert_eq!(p.table_id, 10);
         assert_eq!(p.next_hops.len(), 1);
         assert_eq!(p.next_hops[0].sw_if_index, 1);
         assert_eq!(p.prefix.as_v4(), Some(std::net::Ipv4Addr::new(10, 1, 0, 0)));
@@ -262,9 +278,10 @@ mod tests {
             cost: 20,
             kind: Ospfv3RouteKind::Intra,
         };
-        let p = ospfv3_route_to_proto(&r, Source::Ospf6Intra);
+        let p = ospfv3_route_to_proto(&r, Source::Ospf6Intra, 20);
         assert_eq!(p.source, Source::Ospf6Intra);
         assert_eq!(p.metric, 20);
+        assert_eq!(p.table_id, 20);
         assert_eq!(p.next_hops.len(), 2);
     }
 }

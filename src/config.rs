@@ -28,10 +28,32 @@ pub struct RouterConfig {
     /// follow-up if/when needed.
     #[serde(default)]
     pub route_maps: Vec<RouteMapYaml>,
+    /// Top-level VRF declarations (`name`, `table_id_v4`,
+    /// `table_id_v6`). ospfd reads this to map `--vrf <name>` to
+    /// the v4/v6 FIB ids it stamps onto Routes pushed to ribd.
+    /// Mirror of impd's `vrfs:` block — see imp/api/config.proto.
+    #[serde(default)]
+    pub vrfs: Vec<VrfYaml>,
 }
 
-/// OSPF configuration block.
-#[derive(Debug, Default, Deserialize)]
+/// On-disk VRF declaration. ospfd only cares about the table-ids;
+/// other fields (description) are tolerated but ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VrfYaml {
+    pub name: String,
+    #[serde(default)]
+    pub table_id_v4: u32,
+    #[serde(default)]
+    pub table_id_v6: u32,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// OSPF configuration block. Used both for the top-level `ospf:`
+/// block (default-VRF instance) and as the body shape for per-VRF
+/// entries via `OspfVrfYaml`. The two share fields by composition:
+/// `OspfVrfYaml` flattens an `OspfConfig` and adds `name`.
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct OspfConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -77,6 +99,81 @@ pub struct OspfConfig {
     /// Area-level configuration (type, default_cost, etc.).
     #[serde(default)]
     pub areas: Vec<AreaConfigEntry>,
+    /// Per-VRF instances. Each entry overrides the top-level fields
+    /// for that VRF. impd's supervisor spawns `imp-ospfd@<vrf>`
+    /// children that pass `--vrf <name>` to pick their slice.
+    #[serde(default)]
+    pub vrfs: Vec<OspfVrfYaml>,
+}
+
+/// Per-VRF OSPF configuration block. Mirrors `OspfConfig` (minus the
+/// recursive `vrfs` field) and adds `name`. Loaded by
+/// `OspfDaemonConfig::load_for_vrf` when the daemon is invoked with
+/// `--vrf <name>` and `name` matches.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct OspfVrfYaml {
+    pub name: String,
+    /// Defaults true for per-VRF instances — appearing in the
+    /// `vrfs:` list implies enabled. Operators can still set
+    /// `enabled: false` to keep the slice config-side without
+    /// spawning the daemon.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub router_id: Option<String>,
+    pub reference_bandwidth: Option<u32>,
+    pub spf_delay: Option<u64>,
+    pub spf_holdtime: Option<u64>,
+    pub spf_max_holdtime: Option<u64>,
+    #[serde(default)]
+    pub passive_default: bool,
+    pub distance: Option<u8>,
+    pub distance_intra: Option<u8>,
+    pub distance_inter: Option<u8>,
+    pub distance_external: Option<u8>,
+    #[serde(default)]
+    pub summary_addresses: Vec<SummaryAddressEntry>,
+    #[serde(default)]
+    pub default_originate: bool,
+    #[serde(default)]
+    pub default_originate_always: bool,
+    pub default_originate_metric: Option<u32>,
+    pub default_originate_metric_type: Option<u8>,
+    #[serde(default)]
+    pub redistribute: Vec<RedistributeEntry>,
+    #[serde(default)]
+    pub areas: Vec<AreaConfigEntry>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Convert a per-VRF YAML slice into an OspfConfig that the existing
+/// parser can consume. Drops the `name` field.
+impl From<OspfVrfYaml> for OspfConfig {
+    fn from(v: OspfVrfYaml) -> Self {
+        OspfConfig {
+            enabled: v.enabled,
+            router_id: v.router_id,
+            reference_bandwidth: v.reference_bandwidth,
+            spf_delay: v.spf_delay,
+            spf_holdtime: v.spf_holdtime,
+            spf_max_holdtime: v.spf_max_holdtime,
+            passive_default: v.passive_default,
+            distance: v.distance,
+            distance_intra: v.distance_intra,
+            distance_inter: v.distance_inter,
+            distance_external: v.distance_external,
+            summary_addresses: v.summary_addresses,
+            default_originate: v.default_originate,
+            default_originate_always: v.default_originate_always,
+            default_originate_metric: v.default_originate_metric,
+            default_originate_metric_type: v.default_originate_metric_type,
+            redistribute: v.redistribute,
+            areas: v.areas,
+            vrfs: Vec::new(),
+        }
+    }
 }
 
 /// A summary-address entry from `ospf.summary_addresses[]` or
@@ -97,7 +194,7 @@ pub struct SummaryAddressEntry {
 }
 
 /// Area-level configuration from the config file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AreaConfigEntry {
     pub area_id: serde_yaml::Value,
     /// Area type: "normal", "stub", or "nssa" (default: normal).
@@ -112,7 +209,7 @@ pub struct AreaConfigEntry {
 ///
 /// The actual schema uses `protocol: <name>` with optional `metric`,
 /// `metric_type`, and `route_map` fields.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct RedistributeEntry {
     pub protocol: String,
     #[serde(default)]
@@ -160,6 +257,13 @@ pub struct Ipv4CidrConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct InterfaceConfig {
     pub name: Option<String>,
+    /// VRF the interface lives in. Empty string or "default" means
+    /// the default VRF (table 0). Used to scope per-instance
+    /// adjacency formation: each ospfd instance only forms
+    /// adjacencies on interfaces whose `vrf` matches its
+    /// configured VRF name.
+    #[serde(default)]
+    pub vrf: Option<String>,
     #[serde(default)]
     pub ipv4: Vec<Ipv4AddressConfig>,
     pub ospf_area: Option<serde_yaml::Value>,
@@ -207,6 +311,11 @@ pub struct InterfaceConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct LoopbackConfig {
     pub name: Option<String>,
+    /// VRF the loopback lives in. Same semantics as
+    /// `InterfaceConfig::vrf` — controls which ospfd instance
+    /// will use this loopback.
+    #[serde(default)]
+    pub vrf: Option<String>,
     #[serde(default)]
     pub ipv4: Vec<Ipv4CidrConfig>,
     pub ospf_area: Option<serde_yaml::Value>,
@@ -222,6 +331,15 @@ pub struct LoopbackConfig {
 /// Parsed, validated OSPF daemon configuration.
 #[derive(Debug)]
 pub struct OspfDaemonConfig {
+    /// VRF this instance serves. `None` for the default VRF; the
+    /// per-VRF spawn (`imp-ospfd@<vrf>`) sets `Some("customer_vrf")`.
+    /// Drives adjacency-formation filtering: only interfaces with
+    /// matching `vrf:` field get OSPF on this instance.
+    pub vrf_name: Option<String>,
+    /// IPv4 FIB table-id this instance writes routes into. 0 for
+    /// default VRF; per-VRF instances pick up their VRF's
+    /// `table_id_v4` from the top-level `vrfs:` declaration.
+    pub table_id_v4: u32,
     pub router_id: Ipv4Addr,
     pub reference_bandwidth: u32,
     pub spf_delay_ms: u64,
@@ -401,6 +519,12 @@ pub struct OspfInterfaceConfig {
 /// and per-interface `ospf6_*` fields in the config file.
 #[derive(Debug, Clone)]
 pub struct Ospf6DaemonConfig {
+    /// VRF this instance serves; mirrors OspfDaemonConfig::vrf_name.
+    pub vrf_name: Option<String>,
+    /// IPv6 FIB table-id this instance writes routes into. 0 for
+    /// default; per-VRF instances pick up `table_id_v6` from the
+    /// top-level `vrfs:` declaration.
+    pub table_id_v6: u32,
     pub router_id: Ipv4Addr,
     pub reference_bandwidth: u32,
     pub interfaces: Vec<Ospf6InterfaceConfig>,
@@ -475,13 +599,71 @@ fn compile_route_maps(
 }
 
 impl OspfDaemonConfig {
-    /// Load configuration from a YAML file.
+    /// Load configuration from a YAML file (default-VRF instance).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: RouterConfig = serde_yaml::from_str(&contents)?;
+        Self::from_router_yaml(config, None)
+    }
+
+    /// Load configuration for a per-VRF instance. Looks up
+    /// `ospf.vrfs[name]` for the OSPF block and the top-level
+    /// `vrfs[name]` for the table-id; returns an error if either
+    /// is missing or `table_id_v4 == 0`.
+    pub fn load_for_vrf(path: &Path, vrf_name: &str) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: RouterConfig = serde_yaml::from_str(&contents)?;
+        Self::from_router_yaml(config, Some(vrf_name))
+    }
+
+    /// Build an OspfDaemonConfig for either default-VRF (vrf_name=None)
+    /// or a per-VRF instance (vrf_name=Some). Per-VRF picks
+    /// `config.ospf.vrfs[name]` for the OSPF body and
+    /// `config.vrfs[name].table_id_v4` for the FIB stamp; default-VRF
+    /// uses the flat `config.ospf` block with table_id 0.
+    pub fn from_router_yaml(
+        mut config: RouterConfig,
+        vrf_name: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        // Per-VRF instances pull their slice from `ospf.vrfs[name]`
+        // and resolve table-ids against the top-level `vrfs:` block.
+        let table_id_v4: u32 = match vrf_name {
+            None => 0,
+            Some(name) => {
+                let vrf_yaml = config
+                    .ospf
+                    .vrfs
+                    .iter()
+                    .find(|v| v.name == name)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "--vrf {name}: no matching ospf.vrfs[] block in config"
+                    ))?;
+                let decl = config
+                    .vrfs
+                    .iter()
+                    .find(|v| v.name == name)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "--vrf {name}: VRF not declared in top-level vrfs:"
+                    ))?;
+                if decl.table_id_v4 == 0 {
+                    anyhow::bail!(
+                        "--vrf {name}: table_id_v4 is 0 (reserved for default VRF)"
+                    );
+                }
+                // Replace `config.ospf` with the per-VRF slice so the
+                // existing parser below sees the right shape.
+                let table_id_v4 = decl.table_id_v4;
+                config.ospf = vrf_yaml.into();
+                table_id_v4
+            }
+        };
 
         if !config.ospf.enabled {
-            anyhow::bail!("OSPF is not enabled in configuration");
+            anyhow::bail!(
+                "OSPF is not enabled in configuration{}",
+                vrf_name.map(|v| format!(" for VRF '{v}'")).unwrap_or_default()
+            );
         }
 
         let router_id: Ipv4Addr = config
@@ -496,10 +678,28 @@ impl OspfDaemonConfig {
             anyhow::bail!("OSPF router_id must be set");
         }
 
+        // Filter interfaces / loopbacks to those that live in our VRF.
+        // Empty-string / "default" / missing `vrf:` field all map to
+        // the default VRF (None below).
+        let iface_in_vrf = |iface_vrf: &Option<String>| -> bool {
+            let normalized = iface_vrf
+                .as_deref()
+                .filter(|s| !s.is_empty() && *s != "default")
+                .map(|s| s.to_string());
+            match (&normalized, vrf_name) {
+                (None, None) => true,
+                (Some(n), Some(target)) => n == target,
+                _ => false,
+            }
+        };
+
         let mut interfaces = Vec::new();
 
         // Physical interfaces
         for iface in &config.interfaces {
+            if !iface_in_vrf(&iface.vrf) {
+                continue;
+            }
             if let Some(area_val) = &iface.ospf_area {
                 let area_id = parse_area_id_value(area_val)?;
                 let name = iface.name.as_deref().unwrap_or("").to_string();
@@ -553,6 +753,9 @@ impl OspfDaemonConfig {
 
         // Loopbacks
         for lb in &config.loopbacks {
+            if !iface_in_vrf(&lb.vrf) {
+                continue;
+            }
             if let Some(area_val) = &lb.ospf_area {
                 let area_id = parse_area_id_value(area_val)?;
                 let name = lb.name.as_deref().unwrap_or("").to_string();
@@ -645,6 +848,8 @@ impl OspfDaemonConfig {
         }
 
         Ok(OspfDaemonConfig {
+            vrf_name: vrf_name.map(|s| s.to_string()),
+            table_id_v4,
             router_id,
             reference_bandwidth: config.ospf.reference_bandwidth.unwrap_or(100),
             spf_delay_ms: config.ospf.spf_delay.unwrap_or(50),
@@ -672,11 +877,59 @@ impl OspfDaemonConfig {
 }
 
 impl Ospf6DaemonConfig {
-    /// Load the OSPFv3 daemon configuration from a YAML file. Returns
-    /// Ok(None) when the `ospf6:` block is absent or `enabled: false`.
+    /// Load the OSPFv3 daemon configuration from a YAML file
+    /// (default-VRF instance). Returns Ok(None) when the `ospf6:`
+    /// block is absent or `enabled: false`.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         let contents = std::fs::read_to_string(path)?;
         let config: RouterConfig = serde_yaml::from_str(&contents)?;
+        Self::from_router_yaml(config, None)
+    }
+
+    /// Load the OSPFv3 config for a per-VRF instance. Returns
+    /// Ok(None) when the per-VRF block has `enabled: false`.
+    pub fn load_for_vrf(path: &Path, vrf_name: &str) -> anyhow::Result<Option<Self>> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: RouterConfig = serde_yaml::from_str(&contents)?;
+        Self::from_router_yaml(config, Some(vrf_name))
+    }
+
+    /// Build an Ospf6DaemonConfig for default-VRF (vrf_name=None) or
+    /// a per-VRF instance. Same dispatch shape as
+    /// `OspfDaemonConfig::from_router_yaml`.
+    pub fn from_router_yaml(
+        mut config: RouterConfig,
+        vrf_name: Option<&str>,
+    ) -> anyhow::Result<Option<Self>> {
+        let table_id_v6: u32 = match vrf_name {
+            None => 0,
+            Some(name) => {
+                let vrf_yaml = config
+                    .ospf6
+                    .vrfs
+                    .iter()
+                    .find(|v| v.name == name)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "--vrf {name}: no matching ospf6.vrfs[] block in config"
+                    ))?;
+                let decl = config
+                    .vrfs
+                    .iter()
+                    .find(|v| v.name == name)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "--vrf {name}: VRF not declared in top-level vrfs:"
+                    ))?;
+                if decl.table_id_v6 == 0 {
+                    anyhow::bail!(
+                        "--vrf {name}: table_id_v6 is 0 (reserved for default VRF)"
+                    );
+                }
+                let table_id_v6 = decl.table_id_v6;
+                config.ospf6 = vrf_yaml.into();
+                table_id_v6
+            }
+        };
 
         if !config.ospf6.enabled {
             return Ok(None);
@@ -693,8 +946,25 @@ impl Ospf6DaemonConfig {
             anyhow::bail!("OSPFv3 router_id must be set");
         }
 
+        // Same VRF filter as OspfDaemonConfig — only adopt
+        // interfaces / loopbacks that live in our VRF.
+        let iface_in_vrf = |iface_vrf: &Option<String>| -> bool {
+            let normalized = iface_vrf
+                .as_deref()
+                .filter(|s| !s.is_empty() && *s != "default")
+                .map(|s| s.to_string());
+            match (&normalized, vrf_name) {
+                (None, None) => true,
+                (Some(n), Some(target)) => n == target,
+                _ => false,
+            }
+        };
+
         let mut interfaces = Vec::new();
         for iface in &config.interfaces {
+            if !iface_in_vrf(&iface.vrf) {
+                continue;
+            }
             let Some(area_val) = &iface.ospf6_area else {
                 continue;
             };
@@ -748,6 +1018,9 @@ impl Ospf6DaemonConfig {
         // Loopbacks are modelled as passive P2P interfaces (no hellos,
         // prefix advertised via Intra-Area-Prefix-LSA).
         for lb in &config.loopbacks {
+            if !iface_in_vrf(&lb.vrf) {
+                continue;
+            }
             let Some(area_val) = &lb.ospf6_area else {
                 continue;
             };
@@ -811,6 +1084,8 @@ impl Ospf6DaemonConfig {
         }
 
         Ok(Some(Ospf6DaemonConfig {
+            vrf_name: vrf_name.map(|s| s.to_string()),
+            table_id_v6,
             router_id,
             reference_bandwidth: config.ospf6.reference_bandwidth.unwrap_or(100),
             interfaces,

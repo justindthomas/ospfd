@@ -38,6 +38,11 @@ struct RunArgs {
     vpp_api_socket: String,
     control_socket: String,
     io_backend: IoBackend,
+    /// VRF name passed by the supervisor as `--vrf <name>`. None
+    /// for the default-VRF instance (table 0); per-VRF instances
+    /// (`imp-ospfd@<vrf>`) set Some so the daemon picks its slice
+    /// and stamps its table-id on every Route push to ribd.
+    vrf: Option<String>,
 }
 
 /// Which OSPF I/O backend to use. `Raw` opens AF_INET/SOCK_RAW sockets
@@ -64,7 +69,7 @@ enum OutputFormat {
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!("Usage:");
-    eprintln!("  ospfd [--config PATH] [--vpp-api SOCKET] [--control-socket PATH] [--io raw|punt]");
+    eprintln!("  ospfd [--config PATH] [--vpp-api SOCKET] [--control-socket PATH] [--io raw|punt] [--vrf NAME]");
     eprintln!("  ospfd query <status|neighbors|interfaces|database|routes> [options]");
     eprintln!();
     eprintln!("Query options:");
@@ -106,6 +111,7 @@ fn parse_args() -> Command {
         vpp_api_socket: vpp_api::client::DEFAULT_API_SOCKET.to_string(),
         control_socket: DEFAULT_CONTROL_SOCKET.to_string(),
         io_backend: IoBackend::Raw,
+        vrf: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -117,6 +123,9 @@ fn parse_args() -> Command {
             }
             "--control-socket" => {
                 run.control_socket = args.next().expect("--control-socket requires a path");
+            }
+            "--vrf" => {
+                run.vrf = Some(args.next().expect("--vrf requires a name"));
             }
             "--io" => {
                 let v = args.next().expect("--io requires 'raw' or 'punt'");
@@ -639,10 +648,22 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // its bound sockets.
     let _instance_lock = acquire_instance_lock(&args.control_socket)?;
 
-    // Load configuration
-    tracing::info!(config = %args.config_path.display(), "loading configuration");
-    let config = OspfDaemonConfig::load(&args.config_path)?;
+    // Load configuration. Default-VRF instance: load(); per-VRF
+    // instance (--vrf X): load_for_vrf(X). Either way the resulting
+    // OspfDaemonConfig carries its own table_id_v4 + vrf_name which
+    // get stamped on every Route push and used to filter interfaces.
     tracing::info!(
+        config = %args.config_path.display(),
+        vrf = ?args.vrf,
+        "loading configuration",
+    );
+    let config = match &args.vrf {
+        None => OspfDaemonConfig::load(&args.config_path)?,
+        Some(name) => OspfDaemonConfig::load_for_vrf(&args.config_path, name)?,
+    };
+    tracing::info!(
+        vrf = ?config.vrf_name,
+        table_id_v4 = config.table_id_v4,
         router_id = %config.router_id,
         interfaces = config.interfaces.len(),
         "OSPF configuration loaded"
@@ -901,7 +922,11 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // config section. Only interfaces listed with an ospf6_area are
     // enrolled. If ospf6.enabled is false or missing, the v3 daemon
     // does not start.
-    match ospfd::config::Ospf6DaemonConfig::load(&args.config_path) {
+    let v6_load = match &args.vrf {
+        None => ospfd::config::Ospf6DaemonConfig::load(&args.config_path),
+        Some(name) => ospfd::config::Ospf6DaemonConfig::load_for_vrf(&args.config_path, name),
+    };
+    match v6_load {
         Ok(Some(v3_config)) => {
             // Resolve sw_if_index / kernel_ifindex for each configured v3
             // interface against VPP. We re-use the already-fetched
@@ -975,6 +1000,8 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     })
                     .collect();
                 let v3_cfg = daemon_v3::V3DaemonConfig {
+                    vrf_name: v3_config.vrf_name.clone(),
+                    table_id_v6: v3_config.table_id_v6,
                     router_id: v3_config.router_id,
                     interfaces: v3_ifaces,
                     areas,
@@ -1063,7 +1090,12 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // them. If connect ultimately fails, continue anyway — SPF
     // still runs, the cache fills, and we'll retry on the next
     // successful push.
-    let mut rib_client = RibClient::new("/run/ribd.sock", "ospfd");
+    let client_name = match &config.vrf_name {
+        None => "ospfd".to_string(),
+        Some(v) => format!("ospfd@{v}"),
+    };
+    let mut rib_client = RibClient::new("/run/ribd.sock", client_name)
+        .with_table_ids(config.table_id_v4, 0);
     if let Err(e) = rib_client.connect(Duration::from_secs(10)).await {
         tracing::warn!("ribd connect failed at startup: {} — will retry on next SPF", e);
     }
@@ -1397,8 +1429,12 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             }
 
             _ = sighup.recv() => {
-                tracing::info!(path = %config_path.display(), "SIGHUP: reloading config");
-                match OspfDaemonConfig::load(&config_path) {
+                tracing::info!(path = %config_path.display(), vrf = ?args.vrf, "SIGHUP: reloading config");
+                let reloaded = match &args.vrf {
+                    None => OspfDaemonConfig::load(&config_path),
+                    Some(name) => OspfDaemonConfig::load_for_vrf(&config_path, name),
+                };
+                match reloaded {
                     Ok(new_config) => {
                         let mut inst = instance.lock().await;
                         let changed = inst.reload_config(&new_config);
@@ -1420,7 +1456,11 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 // at startup), and a running v3 losing its config
                 // isn't something we want to tear down live.
                 if let Some(v3) = &v3_handle {
-                    match ospfd::config::Ospf6DaemonConfig::load(&config_path) {
+                    let reloaded_v3 = match &args.vrf {
+                        None => ospfd::config::Ospf6DaemonConfig::load(&config_path),
+                        Some(name) => ospfd::config::Ospf6DaemonConfig::load_for_vrf(&config_path, name),
+                    };
+                    match reloaded_v3 {
                         Ok(Some(new_v3)) => {
                             let mut inst = v3.lock().await;
                             let changed = inst.reload_config(&new_v3);
