@@ -278,13 +278,16 @@ pub struct InterfaceConfig {
     /// `ospf_network_type` is `non-broadcast`.
     #[serde(default)]
     pub ospf_neighbors: Vec<OspfNeighborConfig>,
-    /// Authentication type: "simple", "message-digest", or omitted for none.
+    /// Authentication type: "simple", "message-digest" (RFC 2328 keyed-MD5),
+    /// "hmac-sha-256" / "hmac-sha-384" / "hmac-sha-512" (RFC 5709), or omitted
+    /// for none. MD5 is preserved for legacy interop; new deployments should
+    /// prefer HMAC-SHA-256 or stronger.
     pub ospf_auth_type: Option<String>,
     /// Simple-auth cleartext password.
     pub ospf_auth_key: Option<String>,
-    /// MD5 key ID (1-255) for message-digest auth.
+    /// Crypto key ID (1-255) for any keyed crypto auth type.
     pub ospf_md5_key_id: Option<u8>,
-    /// MD5 cryptographic key for message-digest auth.
+    /// Crypto key for any keyed crypto auth type (MD5 or HMAC-SHA).
     pub ospf_md5_key: Option<String>,
 
     /// ---- OSPFv3 per-interface fields ----
@@ -1148,23 +1151,26 @@ fn parse_auth_key(
     md5_key_id: Option<u8>,
     md5_key: Option<&str>,
 ) -> crate::packet::auth::AuthKey {
-    match auth_type {
-        Some("simple") => match simple_key {
-            Some(k) if !k.is_empty() => {
-                crate::packet::auth::AuthKey::Simple(k.as_bytes().to_vec())
-            }
-            _ => crate::packet::auth::AuthKey::None,
-        },
-        Some("message-digest") | Some("md5") => {
-            match (md5_key_id, md5_key) {
-                (Some(id), Some(k)) if !k.is_empty() => crate::packet::auth::AuthKey::Md5 {
-                    key_id: id,
-                    key: k.as_bytes().to_vec(),
-                },
-                _ => crate::packet::auth::AuthKey::None,
-            }
+    use crate::packet::auth::{AuthKey, HmacAlgo};
+    let crypto_alg = match auth_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("simple") => {
+            return match simple_key {
+                Some(k) if !k.is_empty() => AuthKey::Simple(k.as_bytes().to_vec()),
+                _ => AuthKey::None,
+            };
         }
-        _ => crate::packet::auth::AuthKey::None,
+        Some("message-digest" | "md5") => None, // sentinel for MD5
+        Some("hmac-sha-256" | "hmac-sha256" | "sha256" | "sha-256") => Some(HmacAlgo::Sha256),
+        Some("hmac-sha-384" | "hmac-sha384" | "sha384" | "sha-384") => Some(HmacAlgo::Sha384),
+        Some("hmac-sha-512" | "hmac-sha512" | "sha512" | "sha-512") => Some(HmacAlgo::Sha512),
+        _ => return AuthKey::None,
+    };
+    match (md5_key_id, md5_key) {
+        (Some(id), Some(k)) if !k.is_empty() => match crypto_alg {
+            None => AuthKey::Md5 { key_id: id, key: k.as_bytes().to_vec() },
+            Some(algo) => AuthKey::HmacSha { algo, key_id: id, key: k.as_bytes().to_vec() },
+        },
+        _ => AuthKey::None,
     }
 }
 
