@@ -41,7 +41,12 @@ impl LsUpdateV3Packet {
             });
         }
         let count = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let mut lsas = Vec::with_capacity(count);
+        // Bound by what the buffer can hold — `count` is attacker-
+        // controlled and would otherwise pre-allocate up to ~128 GB.
+        // OSPFv3 has no embedded auth, so any host on the link reaches
+        // this path.
+        let bounded = count.min(data.len().saturating_sub(LSU_V3_MIN_LEN) / LSA_V3_HEADER_LEN);
+        let mut lsas = Vec::with_capacity(bounded);
         let mut off = LSU_V3_MIN_LEN;
         for _ in 0..count {
             if off + LSA_V3_HEADER_LEN > data.len() {
@@ -80,6 +85,25 @@ mod tests {
     use super::*;
     use crate::packet_v3::lsa::LsaV3Type;
     use std::net::Ipv4Addr;
+
+    /// Regression for the F6 fuzz finding: a 4-byte LSU body declaring
+    /// ~791M LSAs must not cause a multi-GB pre-allocation.
+    #[test]
+    fn parse_huge_count_does_not_oom() {
+        let trigger = [0x2f, 0x2f, 0x0a, 0x2f];
+        let res = LsUpdateV3Packet::parse(&trigger);
+        // No allocation explosion. Any returned error/Ok is fine — the
+        // parser may report TooShort because it now actually attempts
+        // to read the LSA headers it claimed to have.
+        let _ = res;
+    }
+
+    #[test]
+    fn parse_u32_max_count_does_not_oom() {
+        let trigger = [0xff, 0xff, 0xff, 0xff];
+        let res = LsUpdateV3Packet::parse(&trigger);
+        let _ = res;
+    }
 
     #[test]
     fn test_lsu_v3_roundtrip_empty() {

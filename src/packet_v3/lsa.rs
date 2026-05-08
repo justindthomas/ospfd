@@ -355,7 +355,11 @@ impl LinkLsaV3 {
         let link_local_address = Ipv6Addr::from(lla_bytes);
         let num_prefixes = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
 
-        let mut prefixes = Vec::with_capacity(num_prefixes);
+        // Bound by buffer size — `num_prefixes` is attacker-controlled.
+        // Minimum prefix encoding is the 4-byte header (PrefixLength=0).
+        const MIN_PREFIX_LEN: usize = 4;
+        let bounded = num_prefixes.min(data.len().saturating_sub(24) / MIN_PREFIX_LEN);
+        let mut prefixes = Vec::with_capacity(bounded);
         let mut off = 24;
         for _ in 0..num_prefixes {
             if off >= data.len() {
@@ -419,7 +423,10 @@ impl IntraAreaPrefixLsaV3 {
         let referenced_advertising_router =
             Ipv4Addr::new(data[8], data[9], data[10], data[11]);
 
-        let mut prefixes = Vec::with_capacity(num_prefixes);
+        // Bound by buffer size — `num_prefixes` is attacker-controlled.
+        const MIN_PREFIX_LEN: usize = 4;
+        let bounded = num_prefixes.min(data.len().saturating_sub(12) / MIN_PREFIX_LEN);
+        let mut prefixes = Vec::with_capacity(bounded);
         let mut off = 12;
         for _ in 0..num_prefixes {
             if off >= data.len() {

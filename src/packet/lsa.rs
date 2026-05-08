@@ -272,7 +272,11 @@ impl RouterLsa {
         let flags = data[1];
         let num_links = u16::from_be_bytes([data[2], data[3]]) as usize;
 
-        let mut links = Vec::with_capacity(num_links);
+        // Bound by buffer size — `num_links` is attacker-controlled.
+        // Each RouterLink is at least 12 bytes (no TOS entries).
+        const MIN_ROUTER_LINK_LEN: usize = 12;
+        let bounded = num_links.min(data.len().saturating_sub(4) / MIN_ROUTER_LINK_LEN);
+        let mut links = Vec::with_capacity(bounded);
         let mut off = 4;
         for _ in 0..num_links {
             if off + 12 > data.len() {
