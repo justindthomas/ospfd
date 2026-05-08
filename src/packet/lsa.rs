@@ -479,6 +479,15 @@ impl Lsa {
     /// Parse a complete LSA (header + body) from a byte slice.
     pub fn parse(data: &[u8]) -> Result<Self, PacketError> {
         let header = LsaHeader::parse(data)?;
+        // RFC 2328: LSA `length` covers the full LSA including the 20-byte
+        // header. A peer-supplied length below that underflows the body-len
+        // subtraction below; reject before computing.
+        if (header.length as usize) < LSA_HEADER_LEN {
+            return Err(PacketError::TooShort {
+                expected: LSA_HEADER_LEN,
+                got: header.length as usize,
+            });
+        }
         let body_len = header.length as usize - LSA_HEADER_LEN;
         let body_data = &data[LSA_HEADER_LEN..LSA_HEADER_LEN + body_len.min(data.len() - LSA_HEADER_LEN)];
 
@@ -663,5 +672,30 @@ mod tests {
             h2.is_more_recent_than(&h1),
             std::cmp::Ordering::Less
         );
+    }
+
+    /// Regression for F8: an LSA whose header `length < 20` previously
+    /// underflowed `header.length - LSA_HEADER_LEN`, panicking in
+    /// debug/fuzz builds. The parser must reject it cleanly instead.
+    #[test]
+    fn parse_lsa_with_length_below_header_len_does_not_panic() {
+        // Valid 20-byte LSA header with length field (bytes 18-19) = 0,
+        // matching the fuzz reproducer extracted from
+        // fuzz/artifacts/parse_v2_lsu/crash-d97051ce... (LSA bytes only).
+        let buf = [
+            0x00, 0x60,                         // ls_age
+            0x0b,                               // options
+            0x03,                               // ls_type = SummaryNetwork
+            0x0b, 0x0b, 0x0b, 0x0b,             // link_state_id
+            0x0b, 0x0b, 0x0b, 0x0b,             // advertising_router
+            0x0b, 0x0b, 0x0b, 0x0b,             // ls_sequence_number
+            0x0b, 0x0b,                         // ls_checksum
+            0x00, 0x00,                         // length = 0 (trigger)
+        ];
+        let res = Lsa::parse(&buf);
+        assert!(matches!(
+            res,
+            Err(PacketError::TooShort { expected: LSA_HEADER_LEN, .. })
+        ));
     }
 }
