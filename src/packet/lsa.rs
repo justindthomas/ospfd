@@ -521,8 +521,11 @@ impl Lsa {
             LsaBody::Opaque(data) => buf.extend_from_slice(data),
         }
 
-        // Fix length
-        let len = buf.len() as u16;
+        // Fix length. Mirrors `lsa_total_length`: the wire field is u16, so
+        // an encoded body that pushes total > 65,535 cannot be represented
+        // and a silent `as u16` truncation would emit a corrupt LSA.
+        let len = u16::try_from(buf.len())
+            .expect("LSA encode: encoded length exceeds u16::MAX");
         buf[18] = (len >> 8) as u8;
         buf[19] = (len & 0xFF) as u8;
 
