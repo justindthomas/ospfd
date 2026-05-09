@@ -107,6 +107,13 @@ pub struct Route6NextHop {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReply {
+    /// VRF this instance serves; None for the default VRF. Multi-
+    /// instance ospfd can run several v2 instances at once, so the
+    /// query CLI prints this as the first line of `query status`
+    /// to identify which control socket the operator is talking
+    /// to.
+    #[serde(default)]
+    pub vrf_name: Option<String>,
     pub router_id: String,
     pub areas: Vec<AreaStatus>,
     pub is_abr: bool,
@@ -371,6 +378,7 @@ fn collect_status(inst: &OspfInstance) -> StatusReply {
         .collect();
 
     StatusReply {
+        vrf_name: inst.vrf_name.clone(),
         router_id: inst.router_id.to_string(),
         areas,
         is_abr: inst.is_abr(),
@@ -577,6 +585,7 @@ fn collect_status_v3(inst: &InstanceV3) -> StatusReply {
         .collect();
 
     StatusReply {
+        vrf_name: inst.vrf_name.clone(),
         router_id: inst.router_id.to_string(),
         areas,
         is_abr: false, // v3 ABR not tracked today

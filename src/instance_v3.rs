@@ -153,6 +153,12 @@ pub struct InterfaceV3 {
 }
 
 pub struct InstanceV3 {
+    /// VRF this instance serves. None for the default VRF (FIB
+    /// table 0); Some(name) for an entry sourced from
+    /// `ospf6.vrfs[<name>]`. Threaded into Status6 so an operator
+    /// running `imp-ospfd query status6` against any per-VRF
+    /// control socket can identify the responding instance.
+    pub vrf_name: Option<String>,
     pub router_id: Ipv4Addr,
     pub interfaces: HashMap<u32, InterfaceV3>,
     pub lsdb: LsdbV3,
@@ -181,6 +187,7 @@ pub struct InstanceV3 {
 impl InstanceV3 {
     pub fn new(router_id: Ipv4Addr) -> Self {
         Self {
+            vrf_name: None,
             router_id,
             interfaces: HashMap::new(),
             lsdb: LsdbV3::new(),

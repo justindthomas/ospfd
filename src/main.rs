@@ -517,6 +517,8 @@ async fn run_query(args: QueryArgs) -> anyhow::Result<()> {
 fn print_response(resp: &ControlResponse) {
     match resp {
         ControlResponse::Status(s) => {
+            let vrf = s.vrf_name.as_deref().unwrap_or("(default)");
+            println!("VRF:                   {}", vrf);
             println!("Router ID:             {}", s.router_id);
             println!("ABR:                   {}", s.is_abr);
             println!("AS-External LSAs:      {}", s.as_external_lsa_count);
@@ -1733,6 +1735,7 @@ async fn spawn_v3_instance(
     };
     let v3_inst = Arc::new(Mutex::new({
         let mut i = InstanceV3::new(v3_config.router_id);
+        i.vrf_name = v3_config.vrf_name.clone();
         i.summary_addresses = v3_config.summary_addresses.clone();
         i
     }));

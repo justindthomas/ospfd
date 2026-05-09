@@ -20,6 +20,13 @@ use crate::rib::OspfRib;
 
 /// The OSPF protocol instance.
 pub struct OspfInstance {
+    /// VRF this instance serves. None for the default VRF (FIB
+    /// table 0); Some(name) for an entry sourced from
+    /// `ospf.vrfs[<name>]`. Plumbed into status replies so an
+    /// operator running `imp-ospfd query status` against any per-
+    /// VRF control socket can see at a glance which instance is
+    /// responding.
+    pub vrf_name: Option<String>,
     /// Our router ID.
     pub router_id: Ipv4Addr,
     /// Areas, keyed by area_id. Each has its own LSDB.
@@ -135,6 +142,7 @@ impl OspfInstance {
             });
 
         OspfInstance {
+            vrf_name: config.vrf_name.clone(),
             router_id: config.router_id,
             areas,
             as_external_lsdb: crate::lsdb::Lsdb::new(config.router_id),
