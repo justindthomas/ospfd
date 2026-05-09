@@ -660,9 +660,22 @@ fn prefix_from_mask(mask: &str) -> u8 {
 async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
     // stderr → journald.
+    // Filter precedence:
+    //   1. RUST_LOG (if set) — operator override.
+    //   2. Fallback: `ospfd=info` so the journal shows hello /
+    //      neighbor / SPF lifecycle without drowning in tokio.
+    // Earlier code chained `add_directive("ospfd=info")` *after*
+    // `from_default_env()`, which made the hardcoded directive
+    // win against any env override (later directives have higher
+    // precedence in EnvFilter). That meant `RUST_LOG=ospfd=debug`
+    // was silently downgraded to info — exactly the wrong shape
+    // when impd's supervisor wants to bump verbosity for a
+    // diagnostic run.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("ospfd=info"));
     tracing_subscriber::fmt()
         .with_ansi(std::env::var_os("NO_COLOR").is_none())
-        .with_env_filter(EnvFilter::from_default_env().add_directive("ospfd=info".parse()?))
+        .with_env_filter(filter)
         .init();
 
     // Acquire the single-instance lock BEFORE doing anything that
