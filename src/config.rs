@@ -308,6 +308,72 @@ pub struct InterfaceConfig {
     /// state on link-local addresses, not router-ids.
     #[serde(default)]
     pub ospf6_neighbors: Vec<Ospf6NeighborConfig>,
+
+    /// VLAN sub-interfaces sitting under this parent. Each sub
+    /// terminates as `<parent>.<vlan_id>` in Linux (lcp-auto-subint
+    /// in VPP creates the TAP), with its own VRF, IP addresses, and
+    /// OSPF settings independent of the parent. ospfd treats them as
+    /// first-class OSPF interfaces — see the inner loop in
+    /// `OspfDaemonConfig::from_router_yaml` (and the v3 equivalent).
+    #[serde(default)]
+    pub subinterfaces: Vec<SubInterfaceConfig>,
+}
+
+/// VLAN sub-interface (OSPF-relevant fields). Mirrors impd's
+/// `SubInterface` struct shape: flat `ipv4` + `ipv4_prefix` (not
+/// the `Vec<Ipv4AddressConfig>` shape parents use), per-sub VRF
+/// independent of the parent, full set of `ospf_*` / `ospf6_*`
+/// knobs.
+#[derive(Debug, Default, Deserialize)]
+pub struct SubInterfaceConfig {
+    pub vlan_id: u16,
+    /// VRF the sub-interface lives in. Independent of the parent —
+    /// `lan.110` in customer_vrf and `lan.120` in default both work.
+    /// Empty string or "default" means the default VRF (table 0).
+    #[serde(default)]
+    pub vrf: Option<String>,
+    /// Sub-interface IPv4 address (no embedded prefix; see
+    /// `ipv4_prefix`). Single address per sub today, mirroring the
+    /// impd shape.
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<u8>,
+    /// Sub-interface IPv6 address. Used by the v3 path for the
+    /// passive/p2p-style address advertisement; OSPFv3 hellos still
+    /// run over link-local.
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_prefix: Option<u8>,
+
+    pub ospf_area: Option<serde_yaml::Value>,
+    pub ospf_cost: Option<u16>,
+    pub ospf_passive: Option<bool>,
+    pub ospf_network_type: Option<String>,
+    pub ospf_hello_interval: Option<u16>,
+    pub ospf_dead_interval: Option<u32>,
+    pub ospf_retransmit_interval: Option<u16>,
+    pub ospf_priority: Option<u8>,
+    #[serde(default)]
+    pub ospf_neighbors: Vec<OspfNeighborConfig>,
+    pub ospf_auth_type: Option<String>,
+    pub ospf_auth_key: Option<String>,
+    pub ospf_md5_key_id: Option<u8>,
+    pub ospf_md5_key: Option<String>,
+
+    pub ospf6_area: Option<serde_yaml::Value>,
+    pub ospf6_cost: Option<u16>,
+    pub ospf6_passive: Option<bool>,
+    pub ospf6_network_type: Option<String>,
+    pub ospf6_hello_interval: Option<u16>,
+    pub ospf6_dead_interval: Option<u32>,
+    pub ospf6_retransmit_interval: Option<u16>,
+    pub ospf6_transmit_delay: Option<u16>,
+    pub ospf6_priority: Option<u8>,
+    pub ospf6_instance_id: Option<u8>,
+    #[serde(default)]
+    pub ospf6_neighbors: Vec<Ospf6NeighborConfig>,
 }
 
 /// Loopback interface (OSPF-relevant fields).
@@ -698,34 +764,101 @@ impl OspfDaemonConfig {
 
         let mut interfaces = Vec::new();
 
-        // Physical interfaces
+        // Physical interfaces. Per-VRF gating is applied per item
+        // (parent + each sub) rather than at the top of the loop —
+        // a sub-interface in `customer_vrf` can hang off a parent
+        // that's in the default VRF, and ospfd-for-customer_vrf
+        // must still see lan.110 even though `lan` itself isn't in
+        // its VRF.
         for iface in &config.interfaces {
-            if !iface_in_vrf(&iface.vrf) {
-                continue;
+            // Parent-interface OSPF
+            if iface_in_vrf(&iface.vrf) {
+                if let Some(area_val) = &iface.ospf_area {
+                    let area_id = parse_area_id_value(area_val)?;
+                    let name = iface.name.as_deref().unwrap_or("").to_string();
+
+                    // Use the first IPv4 address on the interface
+                    let (address, prefix_len) = if let Some(first) = iface.ipv4.first() {
+                        (
+                            first.address.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED),
+                            first.prefix,
+                        )
+                    } else {
+                        (Ipv4Addr::UNSPECIFIED, 24)
+                    };
+
+                    let passive = iface.ospf_passive.unwrap_or(config.ospf.passive_default);
+                    let auth_key = parse_auth_key(
+                        iface.ospf_auth_type.as_deref(),
+                        iface.ospf_auth_key.as_deref(),
+                        iface.ospf_md5_key_id,
+                        iface.ospf_md5_key.as_deref(),
+                    );
+
+                    let static_neighbors: Vec<(Ipv4Addr, u8)> = iface
+                        .ospf_neighbors
+                        .iter()
+                        .filter_map(|n| {
+                            let addr: Ipv4Addr = n.address.parse().ok()?;
+                            Some((addr, n.priority.unwrap_or(1)))
+                        })
+                        .collect();
+                    interfaces.push(OspfInterfaceConfig {
+                        name,
+                        address,
+                        prefix_len,
+                        area_id,
+                        cost: iface.ospf_cost.unwrap_or(10),
+                        passive,
+                        network_type: iface
+                            .ospf_network_type
+                            .clone()
+                            .unwrap_or_else(|| "broadcast".to_string()),
+                        hello_interval: iface.ospf_hello_interval.unwrap_or(10),
+                        dead_interval: iface.ospf_dead_interval.unwrap_or(40),
+                        retransmit_interval: iface.ospf_retransmit_interval.unwrap_or(5),
+                        priority: iface.ospf_priority.unwrap_or(1),
+                        auth_key,
+                        static_neighbors,
+                    });
+                }
             }
-            if let Some(area_val) = &iface.ospf_area {
-                let area_id = parse_area_id_value(area_val)?;
-                let name = iface.name.as_deref().unwrap_or("").to_string();
 
-                // Use the first IPv4 address on the interface
-                let (address, prefix_len) = if let Some(first) = iface.ipv4.first() {
-                    (
-                        first.address.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED),
-                        first.prefix,
-                    )
-                } else {
-                    (Ipv4Addr::UNSPECIFIED, 24)
+            // Sub-interface OSPF. Each sub has its own VRF and IP
+            // and is wired to Linux as `<parent>.<vlan_id>` by
+            // VPP's lcp-auto-subint, so the OspfInterfaceConfig
+            // name is built from the parent name + vlan_id. Parent
+            // name is required — without it we have nothing to
+            // bind raw sockets to, so skip.
+            let parent_name = match iface.name.as_deref() {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            for sub in &iface.subinterfaces {
+                if !iface_in_vrf(&sub.vrf) {
+                    continue;
+                }
+                let Some(area_val) = &sub.ospf_area else {
+                    continue;
                 };
+                let area_id = parse_area_id_value(area_val)?;
+                let name = format!("{parent_name}.{}", sub.vlan_id);
 
-                let passive = iface.ospf_passive.unwrap_or(config.ospf.passive_default);
+                let address = sub
+                    .ipv4
+                    .as_deref()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                let prefix_len = sub.ipv4_prefix.unwrap_or(24);
+
+                let passive = sub.ospf_passive.unwrap_or(config.ospf.passive_default);
                 let auth_key = parse_auth_key(
-                    iface.ospf_auth_type.as_deref(),
-                    iface.ospf_auth_key.as_deref(),
-                    iface.ospf_md5_key_id,
-                    iface.ospf_md5_key.as_deref(),
+                    sub.ospf_auth_type.as_deref(),
+                    sub.ospf_auth_key.as_deref(),
+                    sub.ospf_md5_key_id,
+                    sub.ospf_md5_key.as_deref(),
                 );
-
-                let static_neighbors: Vec<(Ipv4Addr, u8)> = iface
+                let static_neighbors: Vec<(Ipv4Addr, u8)> = sub
                     .ospf_neighbors
                     .iter()
                     .filter_map(|n| {
@@ -738,16 +871,16 @@ impl OspfDaemonConfig {
                     address,
                     prefix_len,
                     area_id,
-                    cost: iface.ospf_cost.unwrap_or(10),
+                    cost: sub.ospf_cost.unwrap_or(10),
                     passive,
-                    network_type: iface
+                    network_type: sub
                         .ospf_network_type
                         .clone()
                         .unwrap_or_else(|| "broadcast".to_string()),
-                    hello_interval: iface.ospf_hello_interval.unwrap_or(10),
-                    dead_interval: iface.ospf_dead_interval.unwrap_or(40),
-                    retransmit_interval: iface.ospf_retransmit_interval.unwrap_or(5),
-                    priority: iface.ospf_priority.unwrap_or(1),
+                    hello_interval: sub.ospf_hello_interval.unwrap_or(10),
+                    dead_interval: sub.ospf_dead_interval.unwrap_or(40),
+                    retransmit_interval: sub.ospf_retransmit_interval.unwrap_or(5),
+                    priority: sub.ospf_priority.unwrap_or(1),
                     auth_key,
                     static_neighbors,
                 });
@@ -964,58 +1097,116 @@ impl Ospf6DaemonConfig {
         };
 
         let mut interfaces = Vec::new();
+        // Parent-VRF gating is per-item (see the v2 equivalent for
+        // rationale): a sub in `customer_vrf` under a default-VRF
+        // parent must still surface in the customer_vrf instance.
         for iface in &config.interfaces {
-            if !iface_in_vrf(&iface.vrf) {
-                continue;
-            }
-            let Some(area_val) = &iface.ospf6_area else {
-                continue;
-            };
-            let area_id = parse_area_id_value(area_val)?;
-            let name = iface.name.as_deref().unwrap_or("").to_string();
-            let passive = iface.ospf6_passive.unwrap_or(config.ospf6.passive_default);
-            // Parse the static NBMA neighbor list (link-local IPv6
-            // addresses) — only meaningful for non-broadcast network
-            // type, but we always parse so misconfigurations show up
-            // as warnings rather than silent drops.
-            let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
-            for n in &iface.ospf6_neighbors {
-                match n.address.parse::<Ipv6Addr>() {
-                    Ok(addr) => {
-                        if !addr.is_unicast_link_local() {
-                            tracing::warn!(
-                                addr = %addr,
-                                "ospf6 static neighbor is not link-local; OSPFv3 expects fe80::/10"
-                            );
+            // Parent-interface OSPFv3
+            if iface_in_vrf(&iface.vrf) {
+                if let Some(area_val) = &iface.ospf6_area {
+                    let area_id = parse_area_id_value(area_val)?;
+                    let name = iface.name.as_deref().unwrap_or("").to_string();
+                    let passive = iface.ospf6_passive.unwrap_or(config.ospf6.passive_default);
+                    // Parse the static NBMA neighbor list (link-local IPv6
+                    // addresses) — only meaningful for non-broadcast network
+                    // type, but we always parse so misconfigurations show up
+                    // as warnings rather than silent drops.
+                    let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
+                    for n in &iface.ospf6_neighbors {
+                        match n.address.parse::<Ipv6Addr>() {
+                            Ok(addr) => {
+                                if !addr.is_unicast_link_local() {
+                                    tracing::warn!(
+                                        addr = %addr,
+                                        "ospf6 static neighbor is not link-local; OSPFv3 expects fe80::/10"
+                                    );
+                                }
+                                v6_static_neighbors.push((addr, n.priority.unwrap_or(1)));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    addr = %n.address,
+                                    error = %e,
+                                    "ignoring invalid ospf6 static neighbor address"
+                                );
+                            }
                         }
-                        v6_static_neighbors.push((addr, n.priority.unwrap_or(1)));
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            addr = %n.address,
-                            error = %e,
-                            "ignoring invalid ospf6 static neighbor address"
-                        );
-                    }
+                    interfaces.push(Ospf6InterfaceConfig {
+                        name,
+                        area_id,
+                        cost: iface.ospf6_cost.unwrap_or(10),
+                        passive,
+                        network_type: iface
+                            .ospf6_network_type
+                            .clone()
+                            .unwrap_or_else(|| "broadcast".to_string()),
+                        hello_interval: iface.ospf6_hello_interval.unwrap_or(10),
+                        dead_interval: iface.ospf6_dead_interval.unwrap_or(40),
+                        retransmit_interval: iface.ospf6_retransmit_interval.unwrap_or(5),
+                        transmit_delay: iface.ospf6_transmit_delay.unwrap_or(1),
+                        priority: iface.ospf6_priority.unwrap_or(1),
+                        instance_id: iface.ospf6_instance_id.unwrap_or(0),
+                        static_neighbors: v6_static_neighbors,
+                    });
                 }
             }
-            interfaces.push(Ospf6InterfaceConfig {
-                name,
-                area_id,
-                cost: iface.ospf6_cost.unwrap_or(10),
-                passive,
-                network_type: iface
-                    .ospf6_network_type
-                    .clone()
-                    .unwrap_or_else(|| "broadcast".to_string()),
-                hello_interval: iface.ospf6_hello_interval.unwrap_or(10),
-                dead_interval: iface.ospf6_dead_interval.unwrap_or(40),
-                retransmit_interval: iface.ospf6_retransmit_interval.unwrap_or(5),
-                transmit_delay: iface.ospf6_transmit_delay.unwrap_or(1),
-                priority: iface.ospf6_priority.unwrap_or(1),
-                instance_id: iface.ospf6_instance_id.unwrap_or(0),
-                static_neighbors: v6_static_neighbors,
-            });
+
+            // Sub-interface OSPFv3. Same name convention as v2
+            // (`<parent>.<vlan_id>`), with the sub's own VRF.
+            let parent_name = match iface.name.as_deref() {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            for sub in &iface.subinterfaces {
+                if !iface_in_vrf(&sub.vrf) {
+                    continue;
+                }
+                let Some(area_val) = &sub.ospf6_area else {
+                    continue;
+                };
+                let area_id = parse_area_id_value(area_val)?;
+                let name = format!("{parent_name}.{}", sub.vlan_id);
+                let passive = sub.ospf6_passive.unwrap_or(config.ospf6.passive_default);
+                let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
+                for n in &sub.ospf6_neighbors {
+                    match n.address.parse::<Ipv6Addr>() {
+                        Ok(addr) => {
+                            if !addr.is_unicast_link_local() {
+                                tracing::warn!(
+                                    addr = %addr,
+                                    "ospf6 static neighbor is not link-local; OSPFv3 expects fe80::/10"
+                                );
+                            }
+                            v6_static_neighbors.push((addr, n.priority.unwrap_or(1)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                addr = %n.address,
+                                error = %e,
+                                "ignoring invalid ospf6 static neighbor address"
+                            );
+                        }
+                    }
+                }
+                interfaces.push(Ospf6InterfaceConfig {
+                    name,
+                    area_id,
+                    cost: sub.ospf6_cost.unwrap_or(10),
+                    passive,
+                    network_type: sub
+                        .ospf6_network_type
+                        .clone()
+                        .unwrap_or_else(|| "broadcast".to_string()),
+                    hello_interval: sub.ospf6_hello_interval.unwrap_or(10),
+                    dead_interval: sub.ospf6_dead_interval.unwrap_or(40),
+                    retransmit_interval: sub.ospf6_retransmit_interval.unwrap_or(5),
+                    transmit_delay: sub.ospf6_transmit_delay.unwrap_or(1),
+                    priority: sub.ospf6_priority.unwrap_or(1),
+                    instance_id: sub.ospf6_instance_id.unwrap_or(0),
+                    static_neighbors: v6_static_neighbors,
+                });
+            }
         }
 
         // Loopbacks are modelled as passive P2P interfaces (no hellos,
@@ -1193,5 +1384,120 @@ fn parse_area_id_value(v: &serde_yaml::Value) -> anyhow::Result<Ipv4Addr> {
             anyhow::bail!("invalid OSPF area ID '{}'", s)
         }
         _ => anyhow::bail!("OSPF area ID must be a number or string, got {:?}", v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml_with_subinterface_ospf(extra: &str) -> RouterConfig {
+        // Minimal router.yaml shape with a single VLAN sub-interface
+        // carrying ospf_area. No top-level ospf.areas — exercising
+        // the path that would have been silently swallowed before
+        // the parent-vrf-gating fix.
+        let body = format!(
+            r#"
+ospf:
+  enabled: true
+  router_id: "10.0.0.1"
+ospf6:
+  enabled: true
+  router_id: "10.0.0.1"
+interfaces:
+  - name: lan
+    iface: enp4s0f1np1
+    pci: "0000:04:00.1"
+    subinterfaces:
+      - vlan_id: 110
+        ipv4: "192.168.37.5"
+        ipv4_prefix: 24
+        ipv6: "2001:db8:37::5"
+        ipv6_prefix: 64
+        create_lcp: true
+        ospf_area: 0
+        ospf6_area: 0
+        {extra}
+"#
+        );
+        serde_yaml::from_str(&body).expect("parse router.yaml")
+    }
+
+    #[test]
+    fn subinterface_ospf_v2_lands_with_dotted_name() {
+        // Regression: an `ospf_area: 0` on a sub-interface must
+        // produce an OspfInterfaceConfig keyed on `<parent>.<vlan_id>`
+        // with the sub's own IPv4 (not the parent's, and not
+        // UNSPECIFIED) — pre-fix, the sub-interface scan didn't
+        // exist and the sub was silently ignored.
+        let cfg = yaml_with_subinterface_ospf("");
+        let parsed = OspfDaemonConfig::from_router_yaml(cfg, None).unwrap();
+        let lan_110 = parsed
+            .interfaces
+            .iter()
+            .find(|i| i.name == "lan.110")
+            .expect("lan.110 in OSPFv2 interface list");
+        assert_eq!(lan_110.address, "192.168.37.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(lan_110.prefix_len, 24);
+        assert_eq!(lan_110.area_id, Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn subinterface_ospf_v3_lands_with_dotted_name() {
+        let cfg = yaml_with_subinterface_ospf("");
+        let parsed = Ospf6DaemonConfig::from_router_yaml(cfg, None).unwrap().expect("v6 cfg");
+        let lan_110 = parsed
+            .interfaces
+            .iter()
+            .find(|i| i.name == "lan.110")
+            .expect("lan.110 in OSPFv3 interface list");
+        assert_eq!(lan_110.area_id, Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn subinterface_in_other_vrf_skipped_by_default_instance() {
+        // The default-VRF instance must skip subs in customer_vrf,
+        // and conversely the customer_vrf instance must pick them
+        // up even when the parent is in the default VRF.
+        let cfg = yaml_with_subinterface_ospf("vrf: customer_vrf");
+        let default_vrf = OspfDaemonConfig::from_router_yaml(cfg, None).unwrap();
+        assert!(
+            default_vrf.interfaces.iter().all(|i| i.name != "lan.110"),
+            "default-VRF instance must not pick up customer_vrf sub"
+        );
+
+        // For per-VRF parse we need to declare the VRF and a per-VRF
+        // OSPF block with its own router_id — otherwise from_router_yaml
+        // bails on the missing per-VRF config.
+        let yaml = r#"
+vrfs:
+  - name: customer_vrf
+    table_id_v4: 100
+    table_id_v6: 100
+ospf:
+  enabled: true
+  router_id: "10.0.0.1"
+  vrfs:
+    - name: customer_vrf
+      enabled: true
+      router_id: "10.0.0.2"
+interfaces:
+  - name: lan
+    iface: enp4s0f1np1
+    pci: "0000:04:00.1"
+    subinterfaces:
+      - vlan_id: 110
+        ipv4: "192.168.37.5"
+        ipv4_prefix: 24
+        create_lcp: true
+        ospf_area: 0
+        vrf: customer_vrf
+"#;
+        let cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
+        let customer = OspfDaemonConfig::from_router_yaml(cfg, Some("customer_vrf")).unwrap();
+        assert!(
+            customer.interfaces.iter().any(|i| i.name == "lan.110"),
+            "customer_vrf instance must pick up its sub even when parent is default-VRF"
+        );
     }
 }
