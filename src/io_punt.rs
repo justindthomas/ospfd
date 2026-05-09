@@ -108,6 +108,71 @@ pub(crate) fn eth_l3_offset(buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// Receiver half of a split PuntSocketIo. Owned by a single
+/// dispatcher task that pulls packets off VPP's punt socket and
+/// forwards them to per-instance mpsc channels keyed on
+/// sw_if_index.
+pub struct PuntSocketRx {
+    rx: mpsc::Receiver<RxPacket>,
+    _reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl PuntSocketRx {
+    pub async fn recv(&mut self) -> Option<RxPacket> {
+        self.rx.recv().await
+    }
+}
+
+/// Sender half of a split PuntSocketIo. Cloneable — each ospfd
+/// instance inside the same process holds a clone for its own
+/// event loop. send() is concurrent-safe because
+/// `StdUnixDatagram::send_to` is kernel-atomic.
+#[derive(Clone)]
+pub struct PuntSocketTx {
+    interfaces: Arc<HashMap<u32, IoInterface>>,
+    tx: Arc<StdUnixDatagram>,
+    vpp_server_path: Arc<String>,
+}
+
+impl PuntSocketTx {
+    pub fn send(&self, packet: &TxPacket) -> std::io::Result<()> {
+        let iface = self.interfaces.get(&packet.sw_if_index).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown sw_if_index {}", packet.sw_if_index),
+            )
+        })?;
+
+        let ip_pkt = build_ip_packet(&packet.src_addr, &packet.dst_addr, &packet.data);
+
+        if is_multicast_v4(&packet.dst_addr) {
+            let dst_mac = multicast_mac_v4(&packet.dst_addr);
+            let mut frame = Vec::with_capacity(14 + ip_pkt.len());
+            frame.extend_from_slice(&dst_mac);
+            frame.extend_from_slice(&iface.mac_address);
+            frame.extend_from_slice(&[0x08, 0x00]);
+            frame.extend_from_slice(&ip_pkt);
+
+            let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + frame.len());
+            dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
+            dgram.extend_from_slice(&PUNT_ACTION_L2.to_le_bytes());
+            dgram.extend_from_slice(&frame);
+            self.tx.send_to(&dgram, self.vpp_server_path.as_str())?;
+        } else {
+            let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + ip_pkt.len());
+            dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
+            dgram.extend_from_slice(&PUNT_ACTION_IP4_ROUTED.to_le_bytes());
+            dgram.extend_from_slice(&ip_pkt);
+            self.tx.send_to(&dgram, self.vpp_server_path.as_str())?;
+        }
+        Ok(())
+    }
+
+    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
+        self.interfaces.get(&sw_if_index)
+    }
+}
+
 /// Punt-socket OSPFv2 I/O backend.
 ///
 /// Owns one client-side Unix datagram socket bound at our pathname
@@ -187,6 +252,39 @@ impl PuntSocketIo {
             rx: chan_rx,
             _reader_task: reader,
         })
+    }
+
+    /// Split into receiver (single-owner) and sender (cloneable)
+    /// halves so a dispatcher task can own the rx side while N
+    /// ospfd instances inside the same process each hold a tx
+    /// clone for their per-instance event loops.
+    ///
+    /// VPP's `punt_socket_register` is global per (af, proto,
+    /// port); we register exactly once at construction, then the
+    /// rx side fans incoming packets out by sw_if_index → owning
+    /// instance and each instance sends back through its tx
+    /// clone. send() is `&self` and `StdUnixDatagram::send_to` is
+    /// kernel-atomic, so concurrent sends across instances are
+    /// safe without any further locking.
+    pub fn into_split(self) -> (PuntSocketRx, PuntSocketTx) {
+        let PuntSocketIo {
+            interfaces,
+            tx,
+            vpp_server_path,
+            rx,
+            _reader_task,
+        } = self;
+        (
+            PuntSocketRx {
+                rx,
+                _reader_task,
+            },
+            PuntSocketTx {
+                interfaces: Arc::new(interfaces),
+                tx: Arc::new(tx),
+                vpp_server_path: Arc::new(vpp_server_path),
+            },
+        )
     }
 
     /// Build a no-op PuntSocketIo with no VPP-side punt

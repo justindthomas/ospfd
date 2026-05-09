@@ -393,3 +393,46 @@ impl Ospfv2Io {
         }
     }
 }
+
+/// Per-OSPF-instance I/O handle inside a multi-instance ospfd
+/// process. Each VRF gets exactly one of these. The Raw variant
+/// owns its sockets (raw sockets are per-iface so per-instance
+/// is the natural boundary); the Punt variant carries an
+/// instance-specific mpsc receiver fed by a shared dispatcher
+/// task plus a clone of the shared PuntSocketTx for outbound.
+///
+/// Same `recv` / `send` / `interface` surface as `Ospfv2Io` so
+/// the existing event-loop body works unchanged across the two
+/// shapes.
+pub enum InstanceIo {
+    Raw(RawSocketIo),
+    Punt(PuntInstanceIo),
+}
+
+pub struct PuntInstanceIo {
+    pub rx: tokio::sync::mpsc::Receiver<RxPacket>,
+    pub tx: crate::io_punt::PuntSocketTx,
+}
+
+impl InstanceIo {
+    pub async fn recv(&mut self) -> Option<RxPacket> {
+        match self {
+            InstanceIo::Raw(io) => io.recv().await,
+            InstanceIo::Punt(io) => io.rx.recv().await,
+        }
+    }
+
+    pub fn send(&self, packet: &TxPacket) -> std::io::Result<()> {
+        match self {
+            InstanceIo::Raw(io) => io.send(packet),
+            InstanceIo::Punt(io) => io.tx.send(packet),
+        }
+    }
+
+    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
+        match self {
+            InstanceIo::Raw(io) => io.interface(sw_if_index),
+            InstanceIo::Punt(io) => io.tx.interface(sw_if_index),
+        }
+    }
+}

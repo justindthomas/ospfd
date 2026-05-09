@@ -11,7 +11,7 @@ use ribd_routemap::{RouteMap, RouteMapYaml};
 use serde::Deserialize;
 
 /// Top-level router configuration (we only deserialize the fields we need).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RouterConfig {
     #[serde(default)]
     pub ospf: OspfConfig,
@@ -236,14 +236,14 @@ impl RedistributeEntry {
 }
 
 /// An IPv4 address assigned to an interface.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct Ipv4AddressConfig {
     pub address: String,
     pub prefix: u8,
 }
 
 /// Interface configuration (OSPF-relevant fields).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct InterfaceConfig {
     pub name: Option<String>,
     /// VRF the interface lives in. Empty string or "default" means
@@ -313,7 +313,7 @@ pub struct InterfaceConfig {
 /// the `Vec<Ipv4AddressConfig>` shape parents use), per-sub VRF
 /// independent of the parent, full set of `ospf_*` / `ospf6_*`
 /// knobs.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct SubInterfaceConfig {
     pub vlan_id: u16,
     /// VRF the sub-interface lives in. Independent of the parent —
@@ -369,7 +369,7 @@ pub struct SubInterfaceConfig {
 /// `LoopbackInterface` shape: flat `ipv4` / `ipv4_prefix` (not a
 /// `Vec<…>` of CIDR objects) — single-address per loopback,
 /// matching what impd writes to /persistent/config/router.yaml.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct LoopbackConfig {
     pub name: Option<String>,
     /// VRF the loopback lives in. Same semantics as
@@ -681,6 +681,54 @@ impl OspfDaemonConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: RouterConfig = serde_yaml::from_str(&contents)?;
         Self::from_router_yaml(config, Some(vrf_name))
+    }
+
+    /// Load every OSPFv2 instance the YAML declares: the default
+    /// VRF (if `ospf.enabled`) plus one per `ospf.vrfs[]` entry
+    /// whose VRF is declared at the top level. Returns an empty
+    /// Vec if no v2 instance is configured.
+    ///
+    /// Used by the multi-instance daemon entry point — one
+    /// process owns every VRF's state, so it needs to see all
+    /// configs at once. Per-VRF entries that fail validation
+    /// (undeclared VRF, table_id_v4=0, …) are skipped with a
+    /// warning rather than aborting the whole load: the default
+    /// instance and any other valid VRFs should still come up.
+    pub fn load_all(path: &Path) -> anyhow::Result<Vec<Self>> {
+        let contents = std::fs::read_to_string(path)?;
+        let parsed: RouterConfig = serde_yaml::from_str(&contents)?;
+        let mut out = Vec::new();
+
+        // Default-VRF — only if ospf.enabled. `from_router_yaml`
+        // bails on disabled; treat that as "no default instance"
+        // rather than a hard failure (per-VRF config alone is a
+        // legitimate deployment shape).
+        if parsed.ospf.enabled {
+            match Self::from_router_yaml(parsed.clone(), None) {
+                Ok(cfg) => out.push(cfg),
+                Err(e) => {
+                    tracing::warn!("ospfv2 default-VRF config invalid: {}", e);
+                }
+            }
+        }
+
+        // Per-VRF instances. Iterate by name so a malformed entry
+        // doesn't cascade across the others.
+        let vrf_names: Vec<String> =
+            parsed.ospf.vrfs.iter().map(|v| v.name.clone()).collect();
+        for name in vrf_names {
+            match Self::from_router_yaml(parsed.clone(), Some(&name)) {
+                Ok(cfg) => out.push(cfg),
+                Err(e) => {
+                    tracing::warn!(
+                        vrf = %name,
+                        "ospfv2 vrf config invalid, skipping: {}", e
+                    );
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Build an OspfDaemonConfig for either default-VRF (vrf_name=None)
@@ -1011,6 +1059,43 @@ impl Ospf6DaemonConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: RouterConfig = serde_yaml::from_str(&contents)?;
         Self::from_router_yaml(config, Some(vrf_name))
+    }
+
+    /// Load every OSPFv3 instance the YAML declares: the default
+    /// VRF (if `ospf6.enabled`) plus one per `ospf6.vrfs[]` entry
+    /// whose VRF is declared at the top level. Returns an empty
+    /// Vec if no v3 instance is configured. Mirrors
+    /// `OspfDaemonConfig::load_all`.
+    pub fn load_all(path: &Path) -> anyhow::Result<Vec<Self>> {
+        let contents = std::fs::read_to_string(path)?;
+        let parsed: RouterConfig = serde_yaml::from_str(&contents)?;
+        let mut out = Vec::new();
+
+        // Default-VRF (Ok(None) means "not enabled" — skip silently).
+        match Self::from_router_yaml(parsed.clone(), None) {
+            Ok(Some(cfg)) => out.push(cfg),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("ospfv3 default-VRF config invalid: {}", e);
+            }
+        }
+
+        let vrf_names: Vec<String> =
+            parsed.ospf6.vrfs.iter().map(|v| v.name.clone()).collect();
+        for name in vrf_names {
+            match Self::from_router_yaml(parsed.clone(), Some(&name)) {
+                Ok(Some(cfg)) => out.push(cfg),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        vrf = %name,
+                        "ospfv3 vrf config invalid, skipping: {}", e
+                    );
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Build an Ospf6DaemonConfig for default-VRF (vrf_name=None) or
