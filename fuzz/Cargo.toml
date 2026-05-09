@@ -1,0 +1,45 @@
+[package]
+name = "ospfd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ospfd]
+path = ".."
+# ospfd has no Cargo features today, so default deps are fine. Path-dep
+# `[patch]` entries in ../Cargo.toml propagate through this dep, so the
+# vpp-api / ribd sibling overrides apply automatically.
+
+[[bin]]
+name = "parse_v2_packet"
+path = "fuzz_targets/parse_v2_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v2_lsu"
+path = "fuzz_targets/parse_v2_lsu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v3_packet"
+path = "fuzz_targets/parse_v3_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_v3_lsu"
+path = "fuzz_targets/parse_v3_lsu.rs"
+test = false
+doc = false
+bench = false
