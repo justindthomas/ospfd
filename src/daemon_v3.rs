@@ -221,7 +221,7 @@ pub async fn run(
             let inst = instance.lock().await;
             inst.interfaces.keys().copied().collect()
         };
-        let externals = discover_externals(&vpp, &enrolled).await;
+        let externals = discover_externals(&vpp, &enrolled, cfg.table_id_v6).await;
         let mut inst = instance.lock().await;
         inst.originate_external_lsas(externals, &cfg.summary_addresses);
     }
@@ -393,7 +393,7 @@ pub async fn run(
                         let inst = instance.lock().await;
                         inst.interfaces.keys().copied().collect()
                     };
-                    let externals = discover_externals(&vpp, &enrolled).await;
+                    let externals = discover_externals(&vpp, &enrolled, cfg.table_id_v6).await;
                     let mut inst = instance.lock().await;
                     inst.originate_external_lsas(externals, &cfg.summary_addresses);
                 }
@@ -511,11 +511,18 @@ pub struct DiscoveredAddrs {
 /// Enumerate all IPv6 prefixes on VPP interfaces that are NOT
 /// enrolled in OSPFv3. Used for `redistribute connected` — these are
 /// the prefixes emitted as Type 5 AS-External-LSAs.
+///
+/// `table_id_v6` is the v6 FIB table-id this ospfd instance owns;
+/// see the v2 equivalent in main.rs for why interfaces in OTHER
+/// tables must be skipped (per-VRF leak prevention).
 pub async fn discover_externals(
     vpp: &vpp_api::VppClient,
     enrolled: &std::collections::HashSet<u32>,
+    table_id_v6: u32,
 ) -> Vec<(Ipv6Addr, u8)> {
-    use vpp_api::generated::interface::{SwInterfaceDetails, SwInterfaceDump};
+    use vpp_api::generated::interface::{
+        SwInterfaceDetails, SwInterfaceDump, SwInterfaceGetTable, SwInterfaceGetTableReply,
+    };
     let vpp_ifaces: Vec<SwInterfaceDetails> = vpp
         .dump::<SwInterfaceDump, SwInterfaceDetails>(SwInterfaceDump::default())
         .await
@@ -527,6 +534,16 @@ pub async fn discover_externals(
         }
         if !vi.flags.is_admin_up() {
             continue;
+        }
+        match vpp
+            .request::<SwInterfaceGetTable, SwInterfaceGetTableReply>(SwInterfaceGetTable {
+                sw_if_index: vi.sw_if_index,
+                is_ipv6: true,
+            })
+            .await
+        {
+            Ok(reply) if reply.retval == 0 && reply.vrf_id == table_id_v6 => {}
+            _ => continue,
         }
         let addrs = discover_addrs_vpp(vpp, vi.sw_if_index).await;
         for p in addrs.global_prefixes {

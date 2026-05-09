@@ -392,11 +392,22 @@ fn resolve_kernel_ifindex(name: &str, total_ms: u64) -> anyhow::Result<u32> {
 /// the prefixes emitted as Type 5 AS-External-LSAs. The OSPF-enrolled
 /// interfaces are advertised intra-area via Router-LSA stub links,
 /// so they MUST be excluded here to avoid double-advertisement.
+///
+/// `table_id_v4` is the FIB table-id this ospfd instance owns
+/// (0 for default-VRF, the VRF's `table_id_v4` for per-VRF
+/// instances). Interfaces in OTHER tables are skipped — a
+/// per-VRF ospfd must not redistribute connected routes that
+/// live in someone else's VRF, otherwise the per-VRF FIB ends
+/// up flooded with foreign prefixes. VPP exposes the per-iface
+/// table via `sw_interface_get_table(sw_if_index, is_ipv6=false)`.
 async fn discover_externals_v4(
     vpp: &vpp_api::VppClient,
     enrolled: &std::collections::HashSet<u32>,
+    table_id_v4: u32,
 ) -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
-    use vpp_api::generated::interface::{SwInterfaceDetails, SwInterfaceDump};
+    use vpp_api::generated::interface::{
+        SwInterfaceDetails, SwInterfaceDump, SwInterfaceGetTable, SwInterfaceGetTableReply,
+    };
     use vpp_api::generated::ip::{IpAddressDetails, IpAddressDump};
 
     let vpp_ifaces: Vec<SwInterfaceDetails> = vpp
@@ -410,6 +421,19 @@ async fn discover_externals_v4(
         }
         if !vi.flags.is_admin_up() {
             continue;
+        }
+        // VRF gate. Treat lookup failure as "stay out" — better
+        // to omit a prefix than to leak a foreign one across
+        // VRF boundaries.
+        match vpp
+            .request::<SwInterfaceGetTable, SwInterfaceGetTableReply>(SwInterfaceGetTable {
+                sw_if_index: vi.sw_if_index,
+                is_ipv6: false,
+            })
+            .await
+        {
+            Ok(reply) if reply.retval == 0 && reply.vrf_id == table_id_v4 => {}
+            _ => continue,
         }
         let v4_addrs = vpp
             .dump::<IpAddressDump, IpAddressDetails>(IpAddressDump {
@@ -875,7 +899,7 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             .map(|i| i.sw_if_index)
             .filter(|s| *s != 0)
             .collect();
-        discover_externals_v4(&vpp, &enrolled).await
+        discover_externals_v4(&vpp, &enrolled, config.table_id_v4).await
     };
     let ext_lsas =
         instance.originate_external_lsas(&redistribute, &externals, &config.summary_addresses);
