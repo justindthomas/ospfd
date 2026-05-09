@@ -183,7 +183,10 @@ async fn reader_task(
                 continue;
             }
         };
-        // Min: 8 desc + 14 eth + 40 v6 header + 16 OSPFv3 header
+        // Min: 8 desc + 14 untagged eth + 40 v6 header + 16
+        // OSPFv3 header. Tagged sub-interfaces add 4+ bytes that
+        // crate::io_punt::eth_l3_offset walks past after this
+        // floor.
         if n < PUNT_DESC_LEN + ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + 16 {
             tracing::debug!(len = n, "v3 punt datagram too short");
             continue;
@@ -192,7 +195,26 @@ async fn reader_task(
         let sw_if_index = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         // buf[4..8] is action — ignore on RX.
 
-        let l3_off = PUNT_DESC_LEN + ETHERNET_HEADER_LEN;
+        // Walk eth header + any VLAN tags to the start of the IP6
+        // header. Hardcoding 14 broke sub-interfaces — see the v2
+        // path's eth_l3_offset for the rationale.
+        let eth_start = PUNT_DESC_LEN;
+        let eth_off = match crate::io_punt::eth_l3_offset(&buf[eth_start..n]) {
+            Some(o) => o,
+            None => {
+                tracing::debug!(len = n, "v3 punt datagram has truncated ethernet header");
+                continue;
+            }
+        };
+        let l3_off = eth_start + eth_off;
+        if l3_off + IPV6_HEADER_LEN > n {
+            tracing::debug!(
+                l3_off,
+                recv = n,
+                "v3 punt datagram truncated before IP6 header"
+            );
+            continue;
+        }
         // Parse IPv6 header.
         let ver_tc = buf[l3_off] >> 4;
         if ver_tc != 6 {

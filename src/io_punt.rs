@@ -68,8 +68,45 @@ const PUNT_ACTION_IP4_ROUTED: u32 = 1;
 /// Size of VPP's punt_packetdesc_t prefix on each datagram.
 const PUNT_DESC_LEN: usize = 8;
 
-/// Size of the ethernet header VPP prepends to RX datagrams.
+/// Size of the *untagged* ethernet header VPP prepends to RX
+/// datagrams. Sub-interfaces (VLAN 802.1Q / QinQ 802.1ad) push
+/// the frame's L3 header 4 / 8 / ... bytes further in — see
+/// `eth_l3_offset` below for the walker that handles those.
 const ETHERNET_HEADER_LEN: usize = 14;
+
+/// Walk past the ethernet header (and any 802.1Q / 802.1ad
+/// VLAN tags) in a punted frame, returning the byte offset of
+/// the L3 header within `buf`. Returns `None` if `buf` is
+/// truncated mid-header.
+///
+/// VPP delivers the frame as it appeared on the wire, including
+/// VLAN tags for sub-interfaces. With a single 802.1Q tag the
+/// header is 18 bytes; QinQ is 22; untagged is 14. The previous
+/// implementation hardcoded 14, which made the L3 parser sit
+/// inside the VLAN tag for any sub-interface — `(0x81 & 0x0f)`
+/// is 1, ihl=4, "bad IPv4 header length" debug log every
+/// hello-interval. Drop the constant offset, walk the
+/// ethertypes instead.
+pub(crate) fn eth_l3_offset(buf: &[u8]) -> Option<usize> {
+    // Minimum: 12 bytes of MAC + 2 bytes ethertype.
+    if buf.len() < 14 {
+        return None;
+    }
+    let mut off = 12; // first ethertype field
+    loop {
+        if off + 2 > buf.len() {
+            return None;
+        }
+        let etype = u16::from_be_bytes([buf[off], buf[off + 1]]);
+        match etype {
+            // 802.1Q / 802.1ad: 2-byte TCI follows, then next
+            // ethertype. Cap the loop at QinQ depth (3) — anything
+            // deeper is malformed and we'd rather drop than spin.
+            0x8100 | 0x88a8 if off < 12 + 12 => off += 4,
+            _ => return Some(off + 2),
+        }
+    }
+}
 
 /// Punt-socket OSPFv2 I/O backend.
 ///
@@ -280,7 +317,9 @@ async fn reader_task(
                 continue;
             }
         };
-        // Minimum datagram = 8 (desc) + 14 (eth) + 20 (ip) + 24 (ospf header)
+        // Minimum datagram = 8 (desc) + 14 (untagged eth) + 20 (ip) + 24 (ospf header).
+        // Tagged sub-interfaces add 4+ bytes; eth_l3_offset
+        // handles those after this floor.
         if n < PUNT_DESC_LEN + ETHERNET_HEADER_LEN + 20 + 24 {
             tracing::debug!(len = n, "punt datagram too short; skipping");
             continue;
@@ -289,8 +328,25 @@ async fn reader_task(
         let sw_if_index = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         // buf[4..8] is the "action" byte — we don't care on RX.
 
-        // Skip punt descriptor + ethernet header.
-        let l3_off = PUNT_DESC_LEN + ETHERNET_HEADER_LEN;
+        // Skip punt descriptor, then walk past the ethernet
+        // header + any VLAN tags to land at the L3 header.
+        let eth_start = PUNT_DESC_LEN;
+        let eth_off = match eth_l3_offset(&buf[eth_start..n]) {
+            Some(o) => o,
+            None => {
+                tracing::debug!(len = n, "punt datagram has truncated ethernet header");
+                continue;
+            }
+        };
+        let l3_off = eth_start + eth_off;
+        if l3_off + 20 > n {
+            tracing::debug!(
+                l3_off,
+                recv = n,
+                "punt datagram truncated before IP header"
+            );
+            continue;
+        }
         // Parse minimal IPv4 fields to extract src/dst + ihl.
         let ver_ihl = buf[l3_off];
         let ihl = (ver_ihl & 0x0f) as usize * 4;
@@ -350,5 +406,61 @@ async fn reader_task(
             // Receiver dropped — daemon is shutting down.
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eth_l3_offset;
+
+    fn mac() -> [u8; 12] {
+        [
+            // dst (b8:3f:d2:14:2d:9f)
+            0xb8, 0x3f, 0xd2, 0x14, 0x2d, 0x9f,
+            // src (3a:e0:a3:25:8e:27)
+            0x3a, 0xe0, 0xa3, 0x25, 0x8e, 0x27,
+        ]
+    }
+
+    #[test]
+    fn untagged_ipv4_returns_14() {
+        let mut buf = mac().to_vec();
+        buf.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
+        buf.extend_from_slice(&[0x45; 20]); // sham IPv4 header
+        assert_eq!(eth_l3_offset(&buf), Some(14));
+    }
+
+    #[test]
+    fn tagged_ipv4_returns_18() {
+        // Regression for the sub-interface punt-RX bug. A single
+        // 802.1Q tag pushes the L3 header to byte 18; the previous
+        // hardcoded 14 landed inside the tag and read 0x81 as
+        // ver/ihl, dropping every hello as "bad IPv4 header
+        // length".
+        let mut buf = mac().to_vec();
+        buf.extend_from_slice(&[0x81, 0x00]); // 802.1Q
+        buf.extend_from_slice(&[0x00, 0x6e]); // VLAN id 110
+        buf.extend_from_slice(&[0x08, 0x00]); // inner ethertype IPv4
+        buf.extend_from_slice(&[0x45; 20]);
+        assert_eq!(eth_l3_offset(&buf), Some(18));
+    }
+
+    #[test]
+    fn qinq_returns_22() {
+        // 802.1ad outer + 802.1Q inner.
+        let mut buf = mac().to_vec();
+        buf.extend_from_slice(&[0x88, 0xa8]);
+        buf.extend_from_slice(&[0x00, 0x10]);
+        buf.extend_from_slice(&[0x81, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x6e]);
+        buf.extend_from_slice(&[0x08, 0x00]);
+        buf.extend_from_slice(&[0x45; 20]);
+        assert_eq!(eth_l3_offset(&buf), Some(22));
+    }
+
+    #[test]
+    fn truncated_returns_none() {
+        let buf = vec![0u8; 8];
+        assert_eq!(eth_l3_offset(&buf), None);
     }
 }
