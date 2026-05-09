@@ -189,6 +189,41 @@ impl PuntSocketIo {
         })
     }
 
+    /// Build a no-op PuntSocketIo with no VPP-side punt
+    /// registration. Used by ospfd instances that have zero
+    /// enrolled interfaces (typically the default-VRF instance
+    /// when every OSPF iface lives in a per-VRF instance) so
+    /// they don't clobber a peer instance's punt registration
+    /// — VPP's punt-socket map is keyed on (af, proto, port)
+    /// globally, register-last-wins.
+    ///
+    /// `recv()` returns None immediately (the channel is closed
+    /// because we never spawn a reader). `send()` returns
+    /// `NotFound` for any sw_if_index because the interface map
+    /// is empty.
+    pub fn new_unregistered(interfaces: Vec<IoInterface>) -> std::io::Result<Self> {
+        let tx = StdUnixDatagram::unbound()?;
+        let iface_map: HashMap<u32, IoInterface> =
+            interfaces.into_iter().map(|i| (i.sw_if_index, i)).collect();
+        // A pre-closed channel — recv yields None immediately.
+        let (chan_tx, chan_rx) = mpsc::channel::<RxPacket>(1);
+        drop(chan_tx);
+        // Spawn a no-op reader task so the JoinHandle has the
+        // expected shape and the destructor doesn't dangle.
+        let reader = tokio::spawn(async {});
+        tracing::info!(
+            interfaces = iface_map.len(),
+            "PuntSocketIo no-op (no enrolled interfaces, skipping VPP punt register)"
+        );
+        Ok(PuntSocketIo {
+            interfaces: iface_map,
+            tx,
+            vpp_server_path: String::new(),
+            rx: chan_rx,
+            _reader_task: reader,
+        })
+    }
+
     pub async fn recv(&mut self) -> Option<RxPacket> {
         self.rx.recv().await
     }

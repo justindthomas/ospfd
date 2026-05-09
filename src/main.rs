@@ -875,16 +875,37 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 None => "/run/ospfd/punt-v4.sock".to_string(),
                 Some(name) => format!("/run/ospfd/punt-v4@{name}.sock"),
             };
-            // Ensure parent dir exists.
-            let _ = std::fs::create_dir_all("/run/ospfd");
-            let vpp_server_path = register_punt_v4(&vpp, &client_path).await?;
-            ospfd::io::Ospfv2Io::Punt(
-                ospfd::io_punt::PuntSocketIo::new(
+            // Skip punt registration entirely when this instance has
+            // zero enrolled interfaces. VPP's punt is keyed on
+            // (af, proto, port) globally — register-last-wins — so a
+            // dormant default-VRF instance with no interfaces would
+            // silently clobber the per-VRF instance's registration
+            // every time the supervisor respawned it. Stay running
+            // (the daemon's other RPCs / control socket / RIB sync
+            // are still useful) but don't touch VPP's punt path.
+            // Re-register on the first interface that arrives via
+            // a future config reload would be the proper followup;
+            // for v1 the supervisor restart picks it up.
+            if io_interfaces.is_empty() {
+                tracing::info!(
+                    "no enrolled interfaces; skipping punt_socket_register \
+                     to avoid clobbering peer instances' registration"
+                );
+                ospfd::io::Ospfv2Io::Punt(ospfd::io_punt::PuntSocketIo::new_unregistered(
                     io_interfaces,
-                    &client_path,
-                    vpp_server_path,
-                )?,
-            )
+                )?)
+            } else {
+                // Ensure parent dir exists.
+                let _ = std::fs::create_dir_all("/run/ospfd");
+                let vpp_server_path = register_punt_v4(&vpp, &client_path).await?;
+                ospfd::io::Ospfv2Io::Punt(
+                    ospfd::io_punt::PuntSocketIo::new(
+                        io_interfaces,
+                        &client_path,
+                        vpp_server_path,
+                    )?,
+                )
+            }
         }
     };
 
