@@ -1600,4 +1600,95 @@ interfaces:
             "customer_vrf instance must pick up its sub even when parent is default-VRF"
         );
     }
+
+    #[test]
+    fn load_all_returns_default_plus_per_vrf_instances() {
+        // The multi-instance entry point loads N OspfDaemonConfigs
+        // from one router.yaml: the default-VRF block (when
+        // `ospf.enabled`) plus one per `ospf.vrfs[]` entry whose
+        // VRF is declared at the top level. Instances missing a
+        // matching `vrfs:` declaration must be silently skipped so
+        // a stale `ospf.vrfs[]` entry doesn't take down the whole
+        // daemon.
+        let yaml = r#"
+vrfs:
+  - name: customer_vrf
+    table_id_v4: 10
+    table_id_v6: 10
+  - name: customer2_vrf
+    table_id_v4: 20
+    table_id_v6: 20
+ospf:
+  enabled: true
+  router_id: "10.0.0.1"
+  vrfs:
+    - name: customer_vrf
+      enabled: true
+      router_id: "10.0.0.2"
+    - name: customer2_vrf
+      enabled: true
+      router_id: "10.0.0.3"
+    - name: undeclared_vrf
+      enabled: true
+      router_id: "10.0.0.4"
+interfaces: []
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "ospfd_load_all_{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, yaml).unwrap();
+        let configs = OspfDaemonConfig::load_all(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Expect 3: default + customer_vrf + customer2_vrf.
+        // undeclared_vrf gets skipped (no top-level vrfs[] match).
+        assert_eq!(
+            configs.len(),
+            3,
+            "expected default + 2 declared VRFs (got {} entries)",
+            configs.len(),
+        );
+
+        let names: Vec<Option<String>> = configs.iter().map(|c| c.vrf_name.clone()).collect();
+        assert!(names.contains(&None), "default-VRF instance missing");
+        assert!(names.contains(&Some("customer_vrf".to_string())));
+        assert!(names.contains(&Some("customer2_vrf".to_string())));
+        assert!(!names.contains(&Some("undeclared_vrf".to_string())));
+
+        // table_id_v4 stamping: default = 0, per-VRF picks up the
+        // top-level `vrfs[].table_id_v4`.
+        let default = configs
+            .iter()
+            .find(|c| c.vrf_name.is_none())
+            .expect("default cfg");
+        assert_eq!(default.table_id_v4, 0);
+        let customer = configs
+            .iter()
+            .find(|c| c.vrf_name.as_deref() == Some("customer_vrf"))
+            .expect("customer_vrf cfg");
+        assert_eq!(customer.table_id_v4, 10);
+        let customer2 = configs
+            .iter()
+            .find(|c| c.vrf_name.as_deref() == Some("customer2_vrf"))
+            .expect("customer2_vrf cfg");
+        assert_eq!(customer2.table_id_v4, 20);
+    }
+
+    #[test]
+    fn load_all_returns_empty_when_ospf_disabled_and_no_vrfs() {
+        let yaml = r#"
+ospf:
+  enabled: false
+interfaces: []
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "ospfd_load_all_disabled_{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, yaml).unwrap();
+        let configs = OspfDaemonConfig::load_all(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(configs.is_empty());
+    }
 }

@@ -1,27 +1,40 @@
-//! ospfd — OSPFv2 with direct VPP FIB programming.
+//! ospfd — OSPFv2 + OSPFv3 with direct VPP FIB programming.
 //!
-//! This daemon implements OSPFv2 (RFC 2328) and programs routes directly
-//! into VPP's FIB via the binary API, bypassing the Linux kernel entirely.
+//! This daemon implements OSPFv2 (RFC 2328) + OSPFv3 (RFC 5340) and
+//! programs routes via imp-ribd into VPP's FIB and the Linux kernel.
+//!
+//! As of the multi-instance refactor, ONE ospfd process owns every
+//! VRF declared in the YAML — the default VRF plus each `ospf.vrfs[]`
+//! / `ospf6.vrfs[]` entry. VPP's `punt_socket_register` is keyed
+//! globally on (af, proto, port) with register-last-wins semantics, so
+//! a per-VRF process model would silently lose punt RX for whichever
+//! ospfd registered last. Single-process owns the punt registration
+//! once and dispatches incoming packets by sw_if_index → owning
+//! instance.
 //!
 //! Usage:
 //!   ospfd --config /etc/ospfd/config.yaml
 //!   ospfd query neighbors                    # query a running daemon
 //!   ospfd query database --area 0.0.0.0
+//!   ospfd query neighbors \
+//!         --control-socket /run/ospfd@customer_vrf.sock
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing_subscriber::EnvFilter;
 
-use ospfd::config::OspfDaemonConfig;
+use ospfd::config::{Ospf6DaemonConfig, OspfDaemonConfig};
 use ospfd::control::{self, ControlRequest, ControlResponse, DEFAULT_CONTROL_SOCKET};
 use ospfd::daemon_v3;
 use ospfd::instance::OspfInstance;
-use ospfd::instance_v3::NetworkTypeV3;
-use ospfd::io::{IoInterface, RawSocketIo, TxPacket};
+use ospfd::instance_v3::{InstanceV3, NetworkTypeV3};
+use ospfd::io::{InstanceIo, IoInterface, PuntInstanceIo, RawSocketIo, RxPacket, TxPacket};
+use ospfd::io_punt::PuntSocketIo;
 use ospfd::packet::auth::{apply_auth, verify_auth};
 use ospfd::packet::{OspfPacket, ALL_SPF_ROUTERS};
 use ospfd::proto::interface::{InterfaceEvent, InterfaceState};
@@ -36,13 +49,18 @@ enum Command {
 struct RunArgs {
     config_path: PathBuf,
     vpp_api_socket: String,
+    /// Path of the lock-file sentinel and the default-VRF control
+    /// socket. Per-VRF control sockets are derived from each
+    /// instance's `cfg.vrf_name`.
     control_socket: String,
     io_backend: IoBackend,
-    /// VRF name passed by the supervisor as `--vrf <name>`. None
-    /// for the default-VRF instance (table 0); per-VRF instances
-    /// (`imp-ospfd@<vrf>`) set Some so the daemon picks its slice
-    /// and stamps its table-id on every Route push to ribd.
-    vrf: Option<String>,
+    /// Deprecated. Pre-multi-instance ospfd accepted `--vrf X` to
+    /// scope the daemon to a single VRF. The supervisor used to
+    /// spawn one process per VRF; that's gone now — a single
+    /// process owns every VRF. The flag is logged-and-ignored for
+    /// one release so old systemd unit files don't fail to start
+    /// during a rolling deploy.
+    vrf_deprecated: Option<String>,
 }
 
 /// Which OSPF I/O backend to use. `Raw` opens AF_INET/SOCK_RAW sockets
@@ -69,7 +87,7 @@ enum OutputFormat {
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!("Usage:");
-    eprintln!("  ospfd [--config PATH] [--vpp-api SOCKET] [--control-socket PATH] [--io raw|punt] [--vrf NAME]");
+    eprintln!("  ospfd [--config PATH] [--vpp-api SOCKET] [--control-socket PATH] [--io raw|punt]");
     eprintln!("  ospfd query <status|neighbors|interfaces|database|routes> [options]");
     eprintln!();
     eprintln!("Query options:");
@@ -77,6 +95,10 @@ fn print_usage_and_exit(code: i32) -> ! {
     eprintln!("  --area <ID>               filter by area ID (e.g., 0.0.0.0)");
     eprintln!("  --type <TYPE>             filter by LSA type");
     eprintln!("                              (router/network/summary/external)");
+    eprintln!();
+    eprintln!("  --vrf <NAME>              DEPRECATED — ignored. A single ospfd");
+    eprintln!("                            process now owns every VRF declared");
+    eprintln!("                            in the config.");
     std::process::exit(code);
 }
 
@@ -111,7 +133,7 @@ fn parse_args() -> Command {
         vpp_api_socket: vpp_api::client::DEFAULT_API_SOCKET.to_string(),
         control_socket: DEFAULT_CONTROL_SOCKET.to_string(),
         io_backend: IoBackend::Raw,
-        vrf: None,
+        vrf_deprecated: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -125,7 +147,7 @@ fn parse_args() -> Command {
                 run.control_socket = args.next().expect("--control-socket requires a path");
             }
             "--vrf" => {
-                run.vrf = Some(args.next().expect("--vrf requires a name"));
+                run.vrf_deprecated = Some(args.next().expect("--vrf requires a name"));
             }
             "--io" => {
                 let v = args.next().expect("--io requires 'raw' or 'punt'");
@@ -217,7 +239,7 @@ fn parse_query_args<I: Iterator<Item = String>>(mut args: I) -> QueryArgs {
 /// Needs a mutable instance reference to bump per-interface crypto sequence
 /// numbers for MD5-authenticated packets.
 fn send_responses(
-    io: &ospfd::io::Ospfv2Io,
+    io: &InstanceIo,
     instance: &mut OspfInstance,
     responses: Vec<(u32, std::net::Ipv4Addr, OspfPacket)>,
 ) {
@@ -657,509 +679,53 @@ fn prefix_from_mask(mask: &str) -> u8 {
     }
 }
 
-async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
-    // Honour NO_COLOR — keeps ANSI escapes out of impd-captured
-    // stderr → journald.
-    // Filter precedence:
-    //   1. RUST_LOG (if set) — operator override.
-    //   2. Fallback: `ospfd=info` so the journal shows hello /
-    //      neighbor / SPF lifecycle without drowning in tokio.
-    // Earlier code chained `add_directive("ospfd=info")` *after*
-    // `from_default_env()`, which made the hardcoded directive
-    // win against any env override (later directives have higher
-    // precedence in EnvFilter). That meant `RUST_LOG=ospfd=debug`
-    // was silently downgraded to info — exactly the wrong shape
-    // when impd's supervisor wants to bump verbosity for a
-    // diagnostic run.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ospfd=info"));
-    tracing_subscriber::fmt()
-        .with_ansi(std::env::var_os("NO_COLOR").is_none())
-        .with_env_filter(filter)
-        .init();
-
-    // Acquire the single-instance lock BEFORE doing anything that
-    // touches shared state (sockets, punt registration, etc.). If
-    // another ospfd is already running against the same control
-    // socket path, bail out with a clear error rather than clobber
-    // its bound sockets.
-    let _instance_lock = acquire_instance_lock(&args.control_socket)?;
-
-    // Load configuration. Default-VRF instance: load(); per-VRF
-    // instance (--vrf X): load_for_vrf(X). Either way the resulting
-    // OspfDaemonConfig carries its own table_id_v4 + vrf_name which
-    // get stamped on every Route push and used to filter interfaces.
-    tracing::info!(
-        config = %args.config_path.display(),
-        vrf = ?args.vrf,
-        "loading configuration",
-    );
-    let config = match &args.vrf {
-        None => OspfDaemonConfig::load(&args.config_path)?,
-        Some(name) => OspfDaemonConfig::load_for_vrf(&args.config_path, name)?,
-    };
-    tracing::info!(
-        vrf = ?config.vrf_name,
-        table_id_v4 = config.table_id_v4,
-        router_id = %config.router_id,
-        interfaces = config.interfaces.len(),
-        "OSPF configuration loaded"
-    );
-
-    // Connect to VPP via the supervisor — survives VPP being slow to
-    // come up at boot. After we have a live client we hand it off to
-    // the rest of init (raw sockets / punt registrations are bound to
-    // the current connection's sw_if_index values, so the simplest
-    // robust recovery on VPP restart is to exit and let systemd
-    // restart us — the lifecycle watcher below does that).
-    tracing::info!(socket = %args.vpp_api_socket, "connecting to VPP");
-    let vpp_supervisor = vpp_api::VppSupervisor::spawn(args.vpp_api_socket.clone());
-    let vpp = vpp_supervisor.wait_ready().await;
-    tracing::info!(client_index = vpp.client_index(), "connected to VPP");
-
-    // Watch for VPP disconnects. On disconnect we log a clear
-    // warning and exit — every component below this point holds
-    // VPP-bound state (raw sockets per sw_if_index, punt
-    // registrations, neighbor LSDB references to interfaces) that
-    // would all need rebuilding from scratch. systemd's restart will
-    // do that with one less moving piece than a hot rebuild.
-    {
-        let mut lifecycle = vpp_supervisor.subscribe();
-        tokio::spawn(async move {
-            while let Ok(ev) = lifecycle.recv().await {
-                if matches!(ev, vpp_api::VppLifecycle::Disconnected) {
-                    tracing::error!("VPP connection lost — exiting so systemd restarts ospfd");
-                    std::process::exit(1);
-                }
-            }
-        });
+/// Derive the per-instance control-socket path from its VRF name.
+/// `None → /run/ospfd.sock`, `Some("customer_vrf") →
+/// /run/ospfd@customer_vrf.sock`. Stable across releases — the
+/// `imp-ospfd query` CLI and external tooling key on these paths.
+fn control_socket_path(vrf_name: &Option<String>) -> String {
+    match vrf_name {
+        None => DEFAULT_CONTROL_SOCKET.to_string(),
+        Some(v) => format!("/run/ospfd@{v}.sock"),
     }
+}
 
-    // Resolve interface sw_if_index values from VPP
-    let vpp_interfaces = vpp
-        .dump::<
-            vpp_api::generated::interface::SwInterfaceDump,
-            vpp_api::generated::interface::SwInterfaceDetails,
-        >(vpp_api::generated::interface::SwInterfaceDump::default())
-        .await?;
+/// Per-v2-instance setup carrying everything its event loop needs.
+/// Built up-front during orchestration so the per-instance task can
+/// just take ownership and run.
+struct V2Setup {
+    cfg: OspfDaemonConfig,
+    instance: Arc<Mutex<OspfInstance>>,
+    /// Interfaces this instance owns, after VPP-side resolution of
+    /// sw_if_index / kernel_ifindex / address. The dispatcher uses
+    /// the sw_if_index here to demux incoming packets to this
+    /// instance.
+    io_interfaces: Vec<IoInterface>,
+}
 
-    // Create OSPF instance
-    let mut instance = OspfInstance::new(&config);
+/// Per-v2-instance event loop, lifted from the pre-multi-instance
+/// monolithic `run_daemon`. Body is unchanged from the single-instance
+/// shape — the only refactor is that I/O now flows through
+/// `InstanceIo` (per-instance mpsc + shared punt-Tx clone, or a
+/// per-instance `RawSocketIo`) rather than the single-process
+/// `Ospfv2Io`.
+async fn run_v2_instance(
+    setup: V2Setup,
+    mut io: InstanceIo,
+    vpp: Arc<vpp_api::VppClient>,
+    config_path: PathBuf,
+    mut sighup_rx: broadcast::Receiver<()>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
+    let V2Setup {
+        cfg: config,
+        instance,
+        io_interfaces: _,
+    } = setup;
 
-    // Map interface names to VPP sw_if_index and kernel ifindex
-    let mut io_interfaces = Vec::new();
-    for iface in &mut instance.interfaces {
-        let vpp_iface = vpp_interfaces
-            .iter()
-            .find(|vi| vi.interface_name == iface.name);
-        let Some(vpp_iface) = vpp_iface else {
-            tracing::warn!(name = %iface.name, "interface not found in VPP, skipping");
-            continue;
-        };
-        iface.sw_if_index = vpp_iface.sw_if_index;
-
-        // VPP is the source of truth for interface addresses. Query
-        // ip_address_dump and override the YAML values with whatever
-        // VPP has actually configured. The YAML address is treated as
-        // a fallback hint (used only if VPP has nothing on this
-        // interface, which usually means a misconfiguration).
-        let v4_addrs = vpp
-            .dump::<
-                vpp_api::generated::ip::IpAddressDump,
-                vpp_api::generated::ip::IpAddressDetails,
-            >(vpp_api::generated::ip::IpAddressDump {
-                sw_if_index: vpp_iface.sw_if_index,
-                is_ipv6: false,
-            })
-            .await
-            .unwrap_or_default();
-        if let Some(d) = v4_addrs.first() {
-            let octets = [
-                d.prefix.address[0],
-                d.prefix.address[1],
-                d.prefix.address[2],
-                d.prefix.address[3],
-            ];
-            let vpp_addr = std::net::Ipv4Addr::from(octets);
-            let vpp_prefix = d.prefix.len;
-            // Convert prefix length to a netmask.
-            let mask_bits: u32 = if vpp_prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - vpp_prefix as u32)
-            };
-            let vpp_mask = std::net::Ipv4Addr::from(mask_bits);
-            if vpp_addr != iface.address || vpp_mask != iface.mask {
-                tracing::info!(
-                    name = %iface.name,
-                    yaml_addr = %iface.address,
-                    yaml_mask = %iface.mask,
-                    vpp_addr = %vpp_addr,
-                    vpp_prefix = vpp_prefix,
-                    "OSPFv2: overriding YAML address with VPP-configured address"
-                );
-            }
-            iface.address = vpp_addr;
-            iface.mask = vpp_mask;
-        } else {
-            tracing::warn!(
-                name = %iface.name,
-                yaml_addr = %iface.address,
-                "OSPFv2: VPP has no IPv4 address on this interface, using YAML value"
-            );
-        }
-
-        // kernel_ifindex is only used by the raw backend (IP_ADD_MEMBERSHIP
-        // + IP_MULTICAST_IF on the LCP TAP). The punt backend doesn't
-        // need it — it sends via VPP's punt socket directly. FreeBSD
-        // has no /sys/class/net at all, so future FreeBSD support must
-        // rely on punt/VCL exclusively.
-        //
-        // For raw, retry the lookup with backoff: impd's supervisor
-        // can start imp-ospfd the moment VPP binds its API socket,
-        // which is often before LCP has materialized the TAPs in the
-        // dataplane netns. Retrying for a few seconds rides out that
-        // race cleanly.
-        let kernel_ifindex = match args.io_backend {
-            IoBackend::Raw => match resolve_kernel_ifindex(&iface.name, 6000) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    tracing::warn!(
-                        name = %iface.name,
-                        "raw backend: no LCP TAP after retries, skipping: {}", e
-                    );
-                    continue;
-                }
-            },
-            IoBackend::Punt => {
-                // Best-effort — log it if available for diagnostics,
-                // but don't skip the interface on failure.
-                get_kernel_ifindex(&iface.name).unwrap_or(0)
-            }
-        };
-
-        tracing::info!(
-            name = %iface.name,
-            sw_if_index = iface.sw_if_index,
-            kernel_ifindex,
-            address = %iface.address,
-            "resolved interface"
-        );
-
-        io_interfaces.push(IoInterface {
-            name: iface.name.clone(),
-            sw_if_index: iface.sw_if_index,
-            kernel_ifindex,
-            address: iface.address,
-            mac_address: vpp_iface.l2_address,
-        });
-    }
-
-    // Open the I/O backend. `args.io_backend` is set from the CLI
-    // `--io raw|punt` flag, defaulting to `raw` for backwards
-    // compatibility. The punt backend additionally issues a
-    // `punt_socket_register` against VPP — see io_punt.rs for details.
-    let mut io = match args.io_backend {
-        IoBackend::Raw => ospfd::io::Ospfv2Io::Raw(RawSocketIo::new(io_interfaces)?),
-        IoBackend::Punt => {
-            // Per-VRF instances must use distinct socket paths.
-            // VPP's `punt_socket_register` is keyed on (af, proto,
-            // port) → socket_path; the second register for the same
-            // tuple OVERWRITES the first inside VPP, so without
-            // per-VRF paths the default-VRF instance silently loses
-            // its punt RX the moment a customer_vrf instance starts.
-            // The Unix-socket bind side has the same hazard:
-            // `remove_file + bind` on a shared path orphans whoever
-            // bound first.
-            let client_path = match &args.vrf {
-                None => "/run/ospfd/punt-v4.sock".to_string(),
-                Some(name) => format!("/run/ospfd/punt-v4@{name}.sock"),
-            };
-            // Skip punt registration entirely when this instance has
-            // zero enrolled interfaces. VPP's punt is keyed on
-            // (af, proto, port) globally — register-last-wins — so a
-            // dormant default-VRF instance with no interfaces would
-            // silently clobber the per-VRF instance's registration
-            // every time the supervisor respawned it. Stay running
-            // (the daemon's other RPCs / control socket / RIB sync
-            // are still useful) but don't touch VPP's punt path.
-            // Re-register on the first interface that arrives via
-            // a future config reload would be the proper followup;
-            // for v1 the supervisor restart picks it up.
-            if io_interfaces.is_empty() {
-                tracing::info!(
-                    "no enrolled interfaces; skipping punt_socket_register \
-                     to avoid clobbering peer instances' registration"
-                );
-                ospfd::io::Ospfv2Io::Punt(ospfd::io_punt::PuntSocketIo::new_unregistered(
-                    io_interfaces,
-                )?)
-            } else {
-                // Ensure parent dir exists.
-                let _ = std::fs::create_dir_all("/run/ospfd");
-                let vpp_server_path = register_punt_v4(&vpp, &client_path).await?;
-                ospfd::io::Ospfv2Io::Punt(
-                    ospfd::io_punt::PuntSocketIo::new(
-                        io_interfaces,
-                        &client_path,
-                        vpp_server_path,
-                    )?,
-                )
-            }
-        }
-    };
-
-    // Bring interfaces up
-    for iface in &mut instance.interfaces {
-        if iface.sw_if_index != 0 {
-            iface.handle_event(&InterfaceEvent::InterfaceUp);
-        }
-    }
-
-    // Originate initial Router-LSA(s) — one per area
-    instance.originate_router_lsas();
-
-    // Originate AS-External LSAs for redistributed routes. We
-    // discover the externals as v4 prefixes on VPP interfaces that
-    // are NOT already enrolled in OSPFv2 (those are advertised
-    // intra-area via the Router-LSA stub-link path).
-    let redistribute = instance.redistribute.clone();
-    let externals = if redistribute.is_empty() {
-        Vec::new()
-    } else {
-        let enrolled: std::collections::HashSet<u32> = instance
-            .interfaces
-            .iter()
-            .map(|i| i.sw_if_index)
-            .filter(|s| *s != 0)
-            .collect();
-        discover_externals_v4(&vpp, &enrolled, config.table_id_v4).await
-    };
-    let ext_lsas =
-        instance.originate_external_lsas(&redistribute, &externals, &config.summary_addresses);
-    if !ext_lsas.is_empty() {
-        tracing::info!(
-            count = ext_lsas.len(),
-            "originated AS-external LSAs from redistribution"
-        );
-    }
-
-    // Summary-address aggregates: one Type 5 per configured
-    // entry. Component prefixes that fall inside the aggregate are
-    // still emitted as their own Type 5s — full exclusion is a
-    // follow-up.
-    if !config.summary_addresses.is_empty() {
-        let summary_lsas =
-            instance.originate_summary_address_lsas(&config.summary_addresses.clone());
-        if !summary_lsas.is_empty() {
-            tracing::info!(
-                count = summary_lsas.len(),
-                "originated summary-address Type 5 LSAs"
-            );
-        }
-    }
-
-    // Default-route origination: when ospf.default_originate is set,
-    // the router advertises 0.0.0.0/0 as a Type 5 external so its
-    // area peers see it as their gateway of last resort.
-    if config.default_originate {
-        if instance
-            .originate_default_route_lsa(
-                config.default_originate_metric,
-                config.default_originate_metric_type,
-            )
-            .is_some()
-        {
-            tracing::info!(
-                metric = config.default_originate_metric,
-                metric_type = config.default_originate_metric_type,
-                "originated default-route Type 5 LSA"
-            );
-        }
-    }
-
-    instance.schedule_spf();
-
-    // Wrap in Arc<Mutex<>> for sharing with the control server task
-    let instance = Arc::new(Mutex::new(instance));
-
-    // Shared handle for the v3 instance. Populated when the v3
-    // daemon is enabled; stays None otherwise so the control
-    // server can tell v3 is disabled.
-    let v3_handle: Option<Arc<Mutex<ospfd::instance_v3::InstanceV3>>>;
-
-    // Spawn the OSPFv3 daemon task, driven by the dedicated `ospf6:`
-    // config section. Only interfaces listed with an ospf6_area are
-    // enrolled. If ospf6.enabled is false or missing, the v3 daemon
-    // does not start.
-    let v6_load = match &args.vrf {
-        None => ospfd::config::Ospf6DaemonConfig::load(&args.config_path),
-        Some(name) => ospfd::config::Ospf6DaemonConfig::load_for_vrf(&args.config_path, name),
-    };
-    match v6_load {
-        Ok(Some(v3_config)) => {
-            // Resolve sw_if_index / kernel_ifindex for each configured v3
-            // interface against VPP. We re-use the already-fetched
-            // vpp_interfaces dump from the v2 resolution above.
-            let mut v3_ifaces = Vec::new();
-            for ic in &v3_config.interfaces {
-                let Some(vpp_iface) = vpp_interfaces
-                    .iter()
-                    .find(|vi| vi.interface_name == ic.name)
-                else {
-                    tracing::warn!(
-                        name = %ic.name,
-                        "OSPFv3: interface not in VPP, skipping"
-                    );
-                    continue;
-                };
-                let kernel_ifindex = match args.io_backend {
-                    IoBackend::Raw => match resolve_kernel_ifindex(&ic.name, 6000) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            tracing::warn!(name = %ic.name,
-                                "OSPFv3 raw: no kernel TAP after retries, skipping: {}", e);
-                            continue;
-                        }
-                    },
-                    IoBackend::Punt => get_kernel_ifindex(&ic.name).unwrap_or(0),
-                };
-                let network_type = match ic.network_type.as_str() {
-                    "point-to-point" => NetworkTypeV3::PointToPoint,
-                    "non-broadcast" => NetworkTypeV3::NonBroadcast,
-                    "point-to-multipoint" => NetworkTypeV3::PointToMultipoint,
-                    _ => NetworkTypeV3::Broadcast,
-                };
-                // link_local + global_prefixes are filled in by
-                // daemon_v3::run() from VPP's ip_address_dump.
-                v3_ifaces.push(daemon_v3::V3InterfaceConfig {
-                    name: ic.name.clone(),
-                    sw_if_index: vpp_iface.sw_if_index,
-                    kernel_ifindex,
-                    link_local: std::net::Ipv6Addr::UNSPECIFIED,
-                    global_prefixes: Vec::new(),
-                    area_id: ic.area_id,
-                    network_type,
-                    hello_interval: ic.hello_interval,
-                    dead_interval: ic.dead_interval as u16,
-                    retransmit_interval: ic.retransmit_interval,
-                    transmit_delay: ic.transmit_delay,
-                    priority: ic.priority,
-                    static_neighbors: ic.static_neighbors.clone(),
-                    mac_address: vpp_iface.l2_address,
-                });
-            }
-
-            if v3_ifaces.is_empty() {
-                tracing::info!(
-                    "OSPFv3: no enrolled interfaces, not starting daemon"
-                );
-                v3_handle = None;
-            } else {
-                // Convert config::AreaType → area::AreaType for the daemon.
-                let areas = v3_config
-                    .areas
-                    .iter()
-                    .map(|a| {
-                        let at = match a.area_type {
-                            ospfd::config::AreaType::Normal => ospfd::area::AreaType::Normal,
-                            ospfd::config::AreaType::Stub => ospfd::area::AreaType::Stub,
-                            ospfd::config::AreaType::Nssa => ospfd::area::AreaType::Nssa,
-                        };
-                        (a.area_id, at)
-                    })
-                    .collect();
-                let v3_cfg = daemon_v3::V3DaemonConfig {
-                    vrf_name: v3_config.vrf_name.clone(),
-                    table_id_v6: v3_config.table_id_v6,
-                    router_id: v3_config.router_id,
-                    interfaces: v3_ifaces,
-                    areas,
-                    redistribute: v3_config.redistribute.clone(),
-                    route_maps: v3_config.route_maps.clone(),
-                    distance: v3_config.distance,
-                    default_originate: v3_config.default_originate,
-                    default_originate_metric: v3_config.default_originate_metric,
-                    default_originate_metric_type: v3_config.default_originate_metric_type,
-                    summary_addresses: v3_config.summary_addresses.clone(),
-                    // Use the same backend as v2 — operators flip
-                    // both sides with a single flag.
-                    io_backend: match args.io_backend {
-                        IoBackend::Raw => daemon_v3::V3IoBackend::Raw,
-                        IoBackend::Punt => daemon_v3::V3IoBackend::Punt,
-                    },
-                };
-                let v3_inst = Arc::new(Mutex::new({
-                    let mut i = ospfd::instance_v3::InstanceV3::new(v3_config.router_id);
-                    i.summary_addresses = v3_config.summary_addresses.clone();
-                    i
-                }));
-                v3_handle = Some(v3_inst.clone());
-                let v3_vpp_socket = args.vpp_api_socket.clone();
-                tokio::spawn(async move {
-                    // Dedicated VPP connection so v3 doesn't share
-                    // request/reply context with the v2 client.
-                    // Same supervisor pattern as v2 — wait for the
-                    // first connection, then run. If this connection
-                    // dies the v2 lifecycle watcher (which observes
-                    // both processes share VPP) will exit() the
-                    // daemon as a whole.
-                    let v3_super = vpp_api::VppSupervisor::spawn(v3_vpp_socket);
-                    let v3_vpp = v3_super.wait_ready().await;
-                    // run() needs an owned VppClient; clone-out via
-                    // Arc isn't sufficient. Reconnect under the v3
-                    // path stays as exit-and-restart for now (the
-                    // outer lifecycle watcher handles that).
-                    let owned = match std::sync::Arc::try_unwrap(v3_vpp) {
-                        Ok(c) => c,
-                        Err(arc) => {
-                            tracing::warn!("v3: VppClient still shared, falling back to direct connect");
-                            drop(arc);
-                            match vpp_api::VppClient::connect(v3_super.socket_path()).await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::error!("OSPFv3 VPP connect failed: {}", e);
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    if let Err(e) = daemon_v3::run(v3_cfg, owned, v3_inst).await {
-                        tracing::error!("OSPFv3 daemon exited: {}", e);
-                    }
-                });
-            }
-        }
-        Ok(None) => {
-            tracing::info!("OSPFv3: not enabled in config, skipping v3 daemon");
-            v3_handle = None;
-        }
-        Err(e) => {
-            tracing::warn!("OSPFv3 config load failed: {} — not starting v3 daemon", e);
-            v3_handle = None;
-        }
-    }
-    // Spawn the control server now that both v2 and (optional) v3
-    // handles are ready.
-    {
-        let ctrl_instance = instance.clone();
-        let ctrl_v3 = v3_handle.clone();
-        let ctrl_socket = args.control_socket.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                control::run_control_server(ctrl_socket, ctrl_instance, ctrl_v3).await
-            {
-                tracing::error!("control server error: {}", e);
-            }
-        });
-    }
-
-    // Connect to ribd so we can push routes instead of
-    // programming VPP directly. We block here with a bounded retry
-    // because OSPF routes don't matter if the RIB can't accept
-    // them. If connect ultimately fails, continue anyway — SPF
-    // still runs, the cache fills, and we'll retry on the next
-    // successful push.
+    // Connect to ribd. Per-instance — each connection stamps its own
+    // (table_id_v4, client_name=ospfd[@vrf]) so ribd can attribute
+    // and replace per-instance route sets independently.
     let client_name = match &config.vrf_name {
         None => "ospfd".to_string(),
         Some(v) => format!("ospfd@{v}"),
@@ -1167,17 +733,25 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     let mut rib_client = RibClient::new("/run/ribd.sock", client_name)
         .with_table_ids(config.table_id_v4, 0);
     if let Err(e) = rib_client.connect(Duration::from_secs(10)).await {
-        tracing::warn!("ribd connect failed at startup: {} — will retry on next SPF", e);
+        tracing::warn!(
+            vrf = ?config.vrf_name,
+            "ribd connect failed at startup: {} — will retry on next SPF",
+            e,
+        );
     }
 
-    // Snapshot the per-sub-type admin-distance overrides. These
-    // don't change at runtime without a daemon restart, so plain
-    // Copy values keep the push-time closure self-contained.
+    // Snapshot per-sub-type admin-distance overrides. Static for the
+    // life of the daemon — reload_config doesn't currently change
+    // these.
     let ad_intra = config.distance_intra.or(config.distance);
     let ad_inter = config.distance_inter.or(config.distance);
     let ad_ext = config.distance_external.or(config.distance);
 
-    tracing::info!("OSPF daemon running — entering main loop");
+    tracing::info!(
+        vrf = ?config.vrf_name,
+        table_id_v4 = config.table_id_v4,
+        "OSPFv2 instance running",
+    );
 
     let mut hello_tick = tokio::time::interval(Duration::from_secs(1));
     hello_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1196,31 +770,17 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // microseconds later sometimes sees a transient empty dump (VPP
     // mid-operation) and demotes the interface back to Down — which
     // tears down everything the daemon just initialised, including the
-    // InterfaceUp transition. With the punt backend that race is
-    // perfectly reproducible because PuntSocketIo::new + register_punt
-    // adds enough VPP back-and-forth before the loop starts that VPP
-    // is still busy when the first tick fires.
+    // InterfaceUp transition.
     let mut iface_refresh = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(30),
         Duration::from_secs(30),
     );
     iface_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // SIGHUP re-reads the config file and calls OspfInstance::reload_config
-    // so external config changes take effect without bouncing
-    // adjacencies. Unhandled SIGHUP would otherwise terminate the
-    // process (kernel default) and force a cold cycle through systemd
-    // Restart=always.
-    let mut sighup = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::hangup(),
-    )?;
-    let config_path = args.config_path.clone();
-
     // Rate-limit for the "authentication failed" log: one warn per
     // (sw_if_index, src_addr) per minute so a misconfigured peer
     // sending Hellos every 10s doesn't flood the log.
-    let mut last_auth_warn: std::collections::HashMap<(u32, std::net::Ipv4Addr), Instant> =
-        std::collections::HashMap::new();
+    let mut last_auth_warn: HashMap<(u32, std::net::Ipv4Addr), Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1228,7 +788,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 let mut inst = instance.lock().await;
 
                 // Verify authentication on the packet before processing.
-                // Look up the receiving interface's auth key.
                 let auth_ok = inst
                     .interfaces
                     .iter()
@@ -1317,8 +876,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 }
 
                 for (idx, sw_if_index, src_addr, raw, destinations) in hellos_to_send {
-                    // Apply per-interface authentication and bump the crypto
-                    // sequence number for MD5 auth.
                     let iface_mut = &mut inst.interfaces[idx];
                     iface_mut.crypto_seq = iface_mut.crypto_seq.wrapping_add(1);
                     let data = apply_auth(raw, &iface_mut.auth_key, iface_mut.crypto_seq);
@@ -1355,7 +912,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     inst.interfaces[idx].handle_event(&InterfaceEvent::WaitTimer);
                 }
 
-                // Emit initial DDs for any ExStart neighbors that need them
                 let pending_dds = inst.emit_pending_dds();
                 send_responses(&io, &mut inst, pending_dds);
             }
@@ -1378,8 +934,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             }
 
             _ = iface_refresh.tick() => {
-                // Snapshot the current OSPF interface set (sw_if_index list)
-                // so we can release the instance lock during the VPP queries.
                 let sw_if_indices: Vec<u32> = {
                     let inst = instance.lock().await;
                     inst.interfaces
@@ -1388,7 +942,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                         .map(|i| i.sw_if_index)
                         .collect()
                 };
-                // Re-dump VPP interface list once for admin/link state.
                 let vpp_ifaces = vpp
                     .dump::<
                         vpp_api::generated::interface::SwInterfaceDump,
@@ -1429,7 +982,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                         let mask = std::net::Ipv4Addr::from(mask_bits);
                         snapshots.push((sw_if_index, addr, mask, oper_up));
                     } else {
-                        // No v4 address — treat as down for OSPF purposes.
                         snapshots.push((
                             sw_if_index,
                             std::net::Ipv4Addr::UNSPECIFIED,
@@ -1438,7 +990,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                         ));
                     }
                 }
-                // Apply with the lock.
                 let mut inst = instance.lock().await;
                 let mut any_change = false;
                 for (sw_if_index, addr, mask, oper_up) in snapshots {
@@ -1460,16 +1011,13 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     std::future::pending::<()>().await;
                 }
             } => {
-                // Compute SPF and update the local cache under
-                // the lock, then release BEFORE talking to
-                // ribd so the RibClient round-trip doesn't
-                // block packet processing.
                 let routes = {
                     let mut inst = instance.lock().await;
                     let routes = inst.run_spf();
                     let (added, deleted) = inst.rib.apply_routes(&routes);
                     if added > 0 || deleted > 0 {
                         tracing::info!(
+                            vrf = ?config.vrf_name,
                             added,
                             deleted,
                             total = inst.rib.route_count(),
@@ -1478,11 +1026,6 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     }
                     routes
                 };
-                // Push to ribd. Bulk is idempotent — ribd
-                // diffs server-side. push_v4 splits routes by
-                // sub-type (intra / inter / ext1 / ext2) into
-                // four separate Bulks so admin-distance
-                // arbitration can treat them independently.
                 if let Err(e) = rib_client
                     .push_v4(&routes, |kind| {
                         use ospfd::proto::spf::OspfRouteKind;
@@ -1494,13 +1037,28 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     })
                     .await
                 {
-                    tracing::warn!("ribd push_v4 failed: {}", e);
+                    tracing::warn!(vrf = ?config.vrf_name, "ribd push_v4 failed: {}", e);
                 }
             }
 
-            _ = sighup.recv() => {
-                tracing::info!(path = %config_path.display(), vrf = ?args.vrf, "SIGHUP: reloading config");
-                let reloaded = match &args.vrf {
+            r = sighup_rx.recv() => {
+                if r.is_err() {
+                    // Sender dropped — process is shutting down. Treat
+                    // identically to a Ctrl-C arm: withdraw and exit.
+                    break;
+                }
+                tracing::info!(
+                    path = %config_path.display(),
+                    vrf = ?config.vrf_name,
+                    "SIGHUP: reloading config",
+                );
+                // Per-instance reload: re-read the VRF's slice of the
+                // config and apply via reload_config. New VRFs added to
+                // YAML on SIGHUP are NOT picked up by an existing
+                // process (Q2 in MULTI_INSTANCE.md) — that requires a
+                // daemon restart, which impd's supervisor will do on
+                // the apply path.
+                let reloaded = match &config.vrf_name {
                     None => OspfDaemonConfig::load(&config_path),
                     Some(name) => OspfDaemonConfig::load_for_vrf(&config_path, name),
                 };
@@ -1509,66 +1067,766 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                         let mut inst = instance.lock().await;
                         let changed = inst.reload_config(&new_config);
                         if changed {
-                            tracing::info!("reload applied");
+                            tracing::info!(vrf = ?config.vrf_name, "reload applied");
                         } else {
-                            tracing::info!("reload: no effective changes");
+                            tracing::info!(
+                                vrf = ?config.vrf_name,
+                                "reload: no effective changes",
+                            );
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "reload failed; keeping prior config live");
-                    }
-                }
-                // v3 reload: same model as v2 — re-parse the v3
-                // config block, push the diff in place. If the v3
-                // config block is absent or disabled we silently
-                // skip; a v3 daemon can't spring into existence
-                // from a reload (interfaces + VPP sockets are wired
-                // at startup), and a running v3 losing its config
-                // isn't something we want to tear down live.
-                if let Some(v3) = &v3_handle {
-                    let reloaded_v3 = match &args.vrf {
-                        None => ospfd::config::Ospf6DaemonConfig::load(&config_path),
-                        Some(name) => ospfd::config::Ospf6DaemonConfig::load_for_vrf(&config_path, name),
-                    };
-                    match reloaded_v3 {
-                        Ok(Some(new_v3)) => {
-                            let mut inst = v3.lock().await;
-                            let changed = inst.reload_config(&new_v3);
-                            if changed {
-                                tracing::info!("reload (v3) applied");
-                            } else {
-                                tracing::info!("reload (v3): no effective changes");
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!(
-                                "reload (v3): config block absent; v3 stays on prior config"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "reload (v3) failed; keeping prior v3 config live"
-                            );
-                        }
+                        tracing::warn!(
+                            vrf = ?config.vrf_name,
+                            error = %e,
+                            "reload failed; keeping prior config live",
+                        );
                     }
                 }
             }
 
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
-                // Push empty Bulks for every sub-type so ribd
-                // withdraws everything attributed to us.
-                if let Err(e) = rib_client.withdraw_v4().await {
-                    tracing::warn!("ribd shutdown withdraw failed: {}", e);
-                }
-                let mut inst = instance.lock().await;
-                inst.rib.clear();
-                tracing::info!("OSPF routes withdrawn from ribd");
+            _ = shutdown_rx.recv() => {
+                tracing::info!(vrf = ?config.vrf_name, "instance shutting down");
                 break;
             }
         }
     }
 
+    // Withdraw our routes from ribd before exiting so the FIB
+    // doesn't carry stale OSPF entries from this instance.
+    if let Err(e) = rib_client.withdraw_v4().await {
+        tracing::warn!(
+            vrf = ?config.vrf_name,
+            "ribd shutdown withdraw failed: {}", e,
+        );
+    }
+    let mut inst = instance.lock().await;
+    inst.rib.clear();
+    tracing::info!(vrf = ?config.vrf_name, "OSPF routes withdrawn from ribd");
     Ok(())
+}
+
+/// Build a V2Setup for one instance: resolve every enrolled interface
+/// against the live VPP, override addresses from VPP's view, originate
+/// initial LSAs, and schedule SPF. Returns the populated setup ready
+/// for run_v2_instance.
+async fn build_v2_setup(
+    vpp: &vpp_api::VppClient,
+    vpp_interfaces: &[vpp_api::generated::interface::SwInterfaceDetails],
+    config: OspfDaemonConfig,
+    io_backend: IoBackend,
+) -> anyhow::Result<V2Setup> {
+    tracing::info!(
+        vrf = ?config.vrf_name,
+        table_id_v4 = config.table_id_v4,
+        router_id = %config.router_id,
+        interfaces = config.interfaces.len(),
+        "OSPFv2 configuration loaded",
+    );
+
+    let mut instance = OspfInstance::new(&config);
+
+    let mut io_interfaces = Vec::new();
+    for iface in &mut instance.interfaces {
+        let vpp_iface = vpp_interfaces
+            .iter()
+            .find(|vi| vi.interface_name == iface.name);
+        let Some(vpp_iface) = vpp_iface else {
+            tracing::warn!(name = %iface.name, vrf = ?config.vrf_name, "interface not found in VPP, skipping");
+            continue;
+        };
+        iface.sw_if_index = vpp_iface.sw_if_index;
+
+        // VPP is authoritative for interface addresses.
+        let v4_addrs = vpp
+            .dump::<
+                vpp_api::generated::ip::IpAddressDump,
+                vpp_api::generated::ip::IpAddressDetails,
+            >(vpp_api::generated::ip::IpAddressDump {
+                sw_if_index: vpp_iface.sw_if_index,
+                is_ipv6: false,
+            })
+            .await
+            .unwrap_or_default();
+        if let Some(d) = v4_addrs.first() {
+            let octets = [
+                d.prefix.address[0],
+                d.prefix.address[1],
+                d.prefix.address[2],
+                d.prefix.address[3],
+            ];
+            let vpp_addr = std::net::Ipv4Addr::from(octets);
+            let vpp_prefix = d.prefix.len;
+            let mask_bits: u32 = if vpp_prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - vpp_prefix as u32)
+            };
+            let vpp_mask = std::net::Ipv4Addr::from(mask_bits);
+            if vpp_addr != iface.address || vpp_mask != iface.mask {
+                tracing::info!(
+                    name = %iface.name,
+                    vrf = ?config.vrf_name,
+                    yaml_addr = %iface.address,
+                    yaml_mask = %iface.mask,
+                    vpp_addr = %vpp_addr,
+                    vpp_prefix = vpp_prefix,
+                    "OSPFv2: overriding YAML address with VPP-configured address"
+                );
+            }
+            iface.address = vpp_addr;
+            iface.mask = vpp_mask;
+        } else {
+            tracing::warn!(
+                name = %iface.name,
+                vrf = ?config.vrf_name,
+                yaml_addr = %iface.address,
+                "OSPFv2: VPP has no IPv4 address on this interface, using YAML value",
+            );
+        }
+
+        let kernel_ifindex = match io_backend {
+            IoBackend::Raw => match resolve_kernel_ifindex(&iface.name, 6000) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %iface.name,
+                        vrf = ?config.vrf_name,
+                        "raw backend: no LCP TAP after retries, skipping: {}", e,
+                    );
+                    continue;
+                }
+            },
+            IoBackend::Punt => {
+                get_kernel_ifindex(&iface.name).unwrap_or(0)
+            }
+        };
+
+        tracing::info!(
+            name = %iface.name,
+            vrf = ?config.vrf_name,
+            sw_if_index = iface.sw_if_index,
+            kernel_ifindex,
+            address = %iface.address,
+            "resolved interface",
+        );
+
+        io_interfaces.push(IoInterface {
+            name: iface.name.clone(),
+            sw_if_index: iface.sw_if_index,
+            kernel_ifindex,
+            address: iface.address,
+            mac_address: vpp_iface.l2_address,
+        });
+    }
+
+    for iface in &mut instance.interfaces {
+        if iface.sw_if_index != 0 {
+            iface.handle_event(&InterfaceEvent::InterfaceUp);
+        }
+    }
+
+    instance.originate_router_lsas();
+
+    let redistribute = instance.redistribute.clone();
+    let externals = if redistribute.is_empty() {
+        Vec::new()
+    } else {
+        let enrolled: std::collections::HashSet<u32> = instance
+            .interfaces
+            .iter()
+            .map(|i| i.sw_if_index)
+            .filter(|s| *s != 0)
+            .collect();
+        discover_externals_v4(vpp, &enrolled, config.table_id_v4).await
+    };
+    let ext_lsas = instance.originate_external_lsas(
+        &redistribute,
+        &externals,
+        &config.summary_addresses,
+    );
+    if !ext_lsas.is_empty() {
+        tracing::info!(
+            vrf = ?config.vrf_name,
+            count = ext_lsas.len(),
+            "originated AS-external LSAs from redistribution",
+        );
+    }
+
+    if !config.summary_addresses.is_empty() {
+        let summary_lsas = instance.originate_summary_address_lsas(&config.summary_addresses.clone());
+        if !summary_lsas.is_empty() {
+            tracing::info!(
+                vrf = ?config.vrf_name,
+                count = summary_lsas.len(),
+                "originated summary-address Type 5 LSAs",
+            );
+        }
+    }
+
+    if config.default_originate {
+        if instance
+            .originate_default_route_lsa(
+                config.default_originate_metric,
+                config.default_originate_metric_type,
+            )
+            .is_some()
+        {
+            tracing::info!(
+                vrf = ?config.vrf_name,
+                metric = config.default_originate_metric,
+                metric_type = config.default_originate_metric_type,
+                "originated default-route Type 5 LSA",
+            );
+        }
+    }
+
+    instance.schedule_spf();
+
+    Ok(V2Setup {
+        cfg: config,
+        instance: Arc::new(Mutex::new(instance)),
+        io_interfaces,
+    })
+}
+
+/// Demux incoming v4 punt packets to the owning instance's mpsc by
+/// sw_if_index. Spawned as a single tokio task per process when the
+/// punt backend is in use; raw mode runs without it (each instance
+/// owns its own per-iface raw sockets).
+///
+/// Packets whose sw_if_index is unknown — typically a transient race
+/// where VPP delivers a frame milliseconds before the daemon's
+/// interface map covers it — are dropped silently. The previous
+/// per-instance code logged them at debug; preserving that here
+/// would amplify the noise across N instances, so the demux drops
+/// quietly.
+async fn v4_dispatcher(
+    mut rx: ospfd::io_punt::PuntSocketRx,
+    iface_to_idx: HashMap<u32, usize>,
+    senders: Vec<mpsc::Sender<RxPacket>>,
+) {
+    while let Some(pkt) = rx.recv().await {
+        dispatch_one(&iface_to_idx, &senders, pkt).await;
+    }
+}
+
+/// One-packet step of the v4 dispatcher; factored out for unit
+/// testing. Returns the index the packet was forwarded to (if any),
+/// for diagnostics.
+async fn dispatch_one(
+    iface_to_idx: &HashMap<u32, usize>,
+    senders: &[mpsc::Sender<RxPacket>],
+    pkt: RxPacket,
+) -> Option<usize> {
+    let idx = *iface_to_idx.get(&pkt.sw_if_index)?;
+    if senders[idx].send(pkt).await.is_err() {
+        // Receiver dropped (instance task exited). Leave the
+        // mapping in place — keeping it here means the dispatcher
+        // continues serving the other instances; only this VRF's
+        // packets get black-holed, which matches what would happen
+        // if its rx channel filled up.
+        return None;
+    }
+    Some(idx)
+}
+
+async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
+    // Filter precedence:
+    //   1. RUST_LOG (if set) — operator override.
+    //   2. Fallback: `ospfd=info` so the journal shows hello /
+    //      neighbor / SPF lifecycle without drowning in tokio.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("ospfd=info"));
+    tracing_subscriber::fmt()
+        .with_ansi(std::env::var_os("NO_COLOR").is_none())
+        .with_env_filter(filter)
+        .init();
+
+    if let Some(name) = &args.vrf_deprecated {
+        tracing::warn!(
+            arg = %name,
+            "--vrf is deprecated and ignored — a single ospfd process now \
+             owns every VRF declared in the config",
+        );
+    }
+
+    // Process-wide lock so a stray second ospfd process can't
+    // clobber our control / punt socket bindings. Anchored on
+    // args.control_socket (default /run/ospfd.sock) — that's the
+    // global "this ospfd process" sentinel even when N per-VRF
+    // control sockets coexist beneath it.
+    let _instance_lock = acquire_instance_lock(&args.control_socket)?;
+
+    tracing::info!(
+        config = %args.config_path.display(),
+        "loading configuration",
+    );
+    let v2_configs = OspfDaemonConfig::load_all(&args.config_path)?;
+    let mut v3_configs_all = Ospf6DaemonConfig::load_all(&args.config_path)?;
+    if v2_configs.is_empty() && v3_configs_all.is_empty() {
+        anyhow::bail!(
+            "no OSPF instances configured (neither ospf nor ospf6 enabled)"
+        );
+    }
+    if v3_configs_all.len() > 1 {
+        let dropped: Vec<Option<String>> = v3_configs_all[1..]
+            .iter()
+            .map(|c| c.vrf_name.clone())
+            .collect();
+        tracing::warn!(
+            kept = ?v3_configs_all[0].vrf_name,
+            dropped = ?dropped,
+            "OSPFv3 multi-instance not yet implemented — running first \
+             ospf6 config only; other v3 VRFs are skipped until the v3 \
+             dispatcher lands",
+        );
+        v3_configs_all.truncate(1);
+    }
+    let v3_config_first = v3_configs_all.into_iter().next();
+
+    tracing::info!(
+        socket = %args.vpp_api_socket,
+        v2_instances = v2_configs.len(),
+        v3_instances = if v3_config_first.is_some() { 1 } else { 0 },
+        "connecting to VPP",
+    );
+    let vpp_supervisor = vpp_api::VppSupervisor::spawn(args.vpp_api_socket.clone());
+    let vpp = vpp_supervisor.wait_ready().await;
+    tracing::info!(client_index = vpp.client_index(), "connected to VPP");
+
+    {
+        let mut lifecycle = vpp_supervisor.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = lifecycle.recv().await {
+                if matches!(ev, vpp_api::VppLifecycle::Disconnected) {
+                    tracing::error!("VPP connection lost — exiting so systemd restarts ospfd");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
+    // One shared interface dump for every instance to read against.
+    let vpp_interfaces = vpp
+        .dump::<
+            vpp_api::generated::interface::SwInterfaceDump,
+            vpp_api::generated::interface::SwInterfaceDetails,
+        >(vpp_api::generated::interface::SwInterfaceDump::default())
+        .await?;
+
+    // Build a V2Setup for every v2 cfg. Failed setups (interface
+    // resolution dies, VPP returns garbage, etc.) get logged but
+    // don't kill the process — the other VRFs should still come
+    // up. Empty-result is allowed; the v2 instance just sits idle.
+    let mut v2_setups: Vec<V2Setup> = Vec::new();
+    for cfg in v2_configs {
+        let vrf = cfg.vrf_name.clone();
+        match build_v2_setup(&vpp, &vpp_interfaces, cfg, args.io_backend).await {
+            Ok(s) => v2_setups.push(s),
+            Err(e) => {
+                tracing::warn!(vrf = ?vrf, "v2 setup failed: {}", e);
+            }
+        }
+    }
+
+    if v2_setups.is_empty() && v3_config_first.is_none() {
+        anyhow::bail!(
+            "no OSPF instances came up — every v2 config failed validation \
+             and v3 is not configured",
+        );
+    }
+
+    // Allocate I/O for every v2 instance:
+    //  * Raw mode: per-instance RawSocketIo (raw sockets are
+    //    per-iface, so per-instance is the natural boundary).
+    //  * Punt mode: a SHARED punt registration covering every
+    //    instance's interfaces, fed by a dispatcher task that
+    //    demuxes by sw_if_index → owning instance.
+    let mut v2_ios: Vec<InstanceIo> = match args.io_backend {
+        IoBackend::Raw => {
+            let mut ios = Vec::with_capacity(v2_setups.len());
+            for s in &v2_setups {
+                ios.push(InstanceIo::Raw(RawSocketIo::new(s.io_interfaces.clone())?));
+            }
+            ios
+        }
+        IoBackend::Punt => {
+            // Union the io_interfaces across every v2 setup.
+            // sw_if_indices are globally unique within VPP so a
+            // simple linear de-dup is fine.
+            let mut all_ifaces: Vec<IoInterface> = Vec::new();
+            for s in &v2_setups {
+                for io in &s.io_interfaces {
+                    if !all_ifaces.iter().any(|x| x.sw_if_index == io.sw_if_index) {
+                        all_ifaces.push(io.clone());
+                    }
+                }
+            }
+
+            // Allocate per-instance mpsc pairs and the dispatcher
+            // map up front, regardless of whether any interfaces
+            // are actually enrolled — empty-iface instances still
+            // need an InstanceIo to feed their event loop.
+            let mut senders: Vec<mpsc::Sender<RxPacket>> = Vec::with_capacity(v2_setups.len());
+            let mut receivers: Vec<mpsc::Receiver<RxPacket>> = Vec::with_capacity(v2_setups.len());
+            for _ in &v2_setups {
+                let (tx, rx) = mpsc::channel::<RxPacket>(256);
+                senders.push(tx);
+                receivers.push(rx);
+            }
+            let mut iface_to_idx: HashMap<u32, usize> = HashMap::new();
+            for (idx, s) in v2_setups.iter().enumerate() {
+                for io in &s.io_interfaces {
+                    iface_to_idx.insert(io.sw_if_index, idx);
+                }
+            }
+
+            if all_ifaces.is_empty() {
+                // No instance enrolls any interface — skip the VPP
+                // punt registration entirely (otherwise we'd
+                // clobber a peer process's registration; VPP's
+                // punt-socket map is keyed on (af, proto, port)
+                // globally). All per-instance receivers will just
+                // never receive anything; the daemon is idle but
+                // running so its control sockets and ribd
+                // bookkeeping still work.
+                tracing::info!(
+                    "no enrolled interfaces across any v2 VRF; \
+                     skipping punt_socket_register",
+                );
+                let punt = PuntSocketIo::new_unregistered(Vec::new())?;
+                let (_rx, tx) = punt.into_split();
+                receivers
+                    .into_iter()
+                    .map(|rx_chan| InstanceIo::Punt(PuntInstanceIo {
+                        rx: rx_chan,
+                        tx: tx.clone(),
+                    }))
+                    .collect()
+            } else {
+                let _ = std::fs::create_dir_all("/run/ospfd");
+                let client_path = "/run/ospfd/punt-v4.sock";
+                let vpp_server_path = register_punt_v4(&vpp, client_path).await?;
+                let punt = PuntSocketIo::new(all_ifaces, client_path, vpp_server_path)?;
+                let (rx, tx) = punt.into_split();
+
+                tokio::spawn(v4_dispatcher(rx, iface_to_idx, senders));
+
+                receivers
+                    .into_iter()
+                    .map(|rx_chan| InstanceIo::Punt(PuntInstanceIo {
+                        rx: rx_chan,
+                        tx: tx.clone(),
+                    }))
+                    .collect()
+            }
+        }
+    };
+
+    // SIGHUP → broadcast to every per-instance task. broadcast::Sender
+    // resends from the time of subscribe, so we subscribe BEFORE
+    // spawning instance tasks below so no signal is missed.
+    let (sighup_tx, _) = broadcast::channel::<()>(8);
+    let (shutdown_tx, _) = broadcast::channel::<()>(8);
+
+    {
+        let tx = sighup_tx.clone();
+        let mut sighup_signal = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup(),
+        )?;
+        tokio::spawn(async move {
+            while sighup_signal.recv().await.is_some() {
+                let _ = tx.send(());
+            }
+        });
+    }
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(());
+        });
+    }
+
+    // Build the v3 instance handle, if a v3 config block exists. v3
+    // remains single-instance for this refactor (multi-instance v3
+    // is a follow-up — see MULTI_INSTANCE.md §6); whichever VRF
+    // appears first in v3_configs is the one we run.
+    let v3_handle: Option<(Option<String>, Arc<Mutex<InstanceV3>>)> =
+        if let Some(v3_config) = v3_config_first {
+            spawn_v3_instance(
+                v3_config,
+                &vpp_interfaces,
+                args.io_backend,
+                &args.vpp_api_socket,
+                &mut sighup_tx.subscribe(),
+            )
+            .await
+        } else {
+            tracing::info!("OSPFv3: not enabled in config, skipping v3 daemon");
+            None
+        };
+
+    // Spawn one control-server task per VRF, pairing v2 + v3
+    // handles by VRF name. Unique paths per VRF preserve the
+    // existing query CLI:
+    //   imp-ospfd query --control-socket /run/ospfd.sock
+    //   imp-ospfd query --control-socket /run/ospfd@<vrf>.sock
+    {
+        let mut by_vrf: BTreeMap<
+            Option<String>,
+            (Option<Arc<Mutex<OspfInstance>>>, Option<Arc<Mutex<InstanceV3>>>),
+        > = BTreeMap::new();
+        for s in &v2_setups {
+            by_vrf.entry(s.cfg.vrf_name.clone()).or_default().0 = Some(s.instance.clone());
+        }
+        if let Some((vrf, h)) = &v3_handle {
+            by_vrf.entry(vrf.clone()).or_default().1 = Some(h.clone());
+        }
+        for (vrf, (v2h, v3h)) in by_vrf {
+            let path = control_socket_path(&vrf);
+            // control::run_control_server requires a v2 handle. If a
+            // VRF has only v3 (currently impossible — the v3 spawn
+            // pairs to a v2 by VRF name — but defensive for the
+            // future), skip the bind and warn.
+            let Some(v2_inst) = v2h else {
+                tracing::warn!(vrf = ?vrf, "v3-only VRF has no control socket");
+                continue;
+            };
+            let v3_inst = v3h;
+            tokio::spawn(async move {
+                if let Err(e) = control::run_control_server(path.clone(), v2_inst, v3_inst).await {
+                    tracing::error!(socket = %path, "control server error: {}", e);
+                }
+            });
+        }
+    }
+
+    // Spawn one tokio task per v2 instance. Each task owns its slice
+    // of state — instance, ribd connection, control loop — and
+    // tickets back through the broadcast channels for SIGHUP / Ctrl-C.
+    let mut tasks = Vec::with_capacity(v2_setups.len());
+    let mut ios_iter = v2_ios.drain(..);
+    for setup in v2_setups {
+        let io = ios_iter.next().expect("io count must match setup count");
+        let vpp_for_task = vpp.clone();
+        let config_path = args.config_path.clone();
+        let sighup_rx = sighup_tx.subscribe();
+        let shutdown_rx = shutdown_tx.subscribe();
+        let vrf = setup.cfg.vrf_name.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) =
+                run_v2_instance(setup, io, vpp_for_task, config_path, sighup_rx, shutdown_rx)
+                    .await
+            {
+                tracing::error!(vrf = ?vrf, "v2 instance task exited with error: {}", e);
+            }
+        }));
+    }
+
+    tracing::info!(
+        instances = tasks.len(),
+        "ospfd: all instance tasks spawned, entering supervision",
+    );
+
+    // Wait for all v2 tasks to complete. Ctrl-C broadcast triggers
+    // each instance's shutdown branch, so this returns when every
+    // instance has finished its withdraw.
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    Ok(())
+}
+
+/// Build and spawn the OSPFv3 daemon for a single config block.
+/// Returns `Some((vrf_name, Arc<Mutex<InstanceV3>>))` for control-
+/// server pairing, or `None` if v3 has no enrolled interfaces.
+async fn spawn_v3_instance(
+    v3_config: Ospf6DaemonConfig,
+    vpp_interfaces: &[vpp_api::generated::interface::SwInterfaceDetails],
+    io_backend: IoBackend,
+    vpp_api_socket: &str,
+    _sighup_rx: &mut broadcast::Receiver<()>,
+) -> Option<(Option<String>, Arc<Mutex<InstanceV3>>)> {
+    let mut v3_ifaces = Vec::new();
+    for ic in &v3_config.interfaces {
+        let Some(vpp_iface) = vpp_interfaces
+            .iter()
+            .find(|vi| vi.interface_name == ic.name)
+        else {
+            tracing::warn!(name = %ic.name, "OSPFv3: interface not in VPP, skipping");
+            continue;
+        };
+        let kernel_ifindex = match io_backend {
+            IoBackend::Raw => match resolve_kernel_ifindex(&ic.name, 6000) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %ic.name,
+                        "OSPFv3 raw: no kernel TAP after retries, skipping: {}", e,
+                    );
+                    continue;
+                }
+            },
+            IoBackend::Punt => get_kernel_ifindex(&ic.name).unwrap_or(0),
+        };
+        let network_type = match ic.network_type.as_str() {
+            "point-to-point" => NetworkTypeV3::PointToPoint,
+            "non-broadcast" => NetworkTypeV3::NonBroadcast,
+            "point-to-multipoint" => NetworkTypeV3::PointToMultipoint,
+            _ => NetworkTypeV3::Broadcast,
+        };
+        v3_ifaces.push(daemon_v3::V3InterfaceConfig {
+            name: ic.name.clone(),
+            sw_if_index: vpp_iface.sw_if_index,
+            kernel_ifindex,
+            link_local: std::net::Ipv6Addr::UNSPECIFIED,
+            global_prefixes: Vec::new(),
+            area_id: ic.area_id,
+            network_type,
+            hello_interval: ic.hello_interval,
+            dead_interval: ic.dead_interval as u16,
+            retransmit_interval: ic.retransmit_interval,
+            transmit_delay: ic.transmit_delay,
+            priority: ic.priority,
+            static_neighbors: ic.static_neighbors.clone(),
+            mac_address: vpp_iface.l2_address,
+        });
+    }
+
+    if v3_ifaces.is_empty() {
+        tracing::info!("OSPFv3: no enrolled interfaces, not starting daemon");
+        return None;
+    }
+
+    let areas = v3_config
+        .areas
+        .iter()
+        .map(|a| {
+            let at = match a.area_type {
+                ospfd::config::AreaType::Normal => ospfd::area::AreaType::Normal,
+                ospfd::config::AreaType::Stub => ospfd::area::AreaType::Stub,
+                ospfd::config::AreaType::Nssa => ospfd::area::AreaType::Nssa,
+            };
+            (a.area_id, at)
+        })
+        .collect();
+    let v3_cfg = daemon_v3::V3DaemonConfig {
+        vrf_name: v3_config.vrf_name.clone(),
+        table_id_v6: v3_config.table_id_v6,
+        router_id: v3_config.router_id,
+        interfaces: v3_ifaces,
+        areas,
+        redistribute: v3_config.redistribute.clone(),
+        route_maps: v3_config.route_maps.clone(),
+        distance: v3_config.distance,
+        default_originate: v3_config.default_originate,
+        default_originate_metric: v3_config.default_originate_metric,
+        default_originate_metric_type: v3_config.default_originate_metric_type,
+        summary_addresses: v3_config.summary_addresses.clone(),
+        io_backend: match io_backend {
+            IoBackend::Raw => daemon_v3::V3IoBackend::Raw,
+            IoBackend::Punt => daemon_v3::V3IoBackend::Punt,
+        },
+    };
+    let v3_inst = Arc::new(Mutex::new({
+        let mut i = InstanceV3::new(v3_config.router_id);
+        i.summary_addresses = v3_config.summary_addresses.clone();
+        i
+    }));
+    let v3_inst_clone = v3_inst.clone();
+    let v3_vpp_socket = vpp_api_socket.to_string();
+    tokio::spawn(async move {
+        let v3_super = vpp_api::VppSupervisor::spawn(v3_vpp_socket);
+        let v3_vpp = v3_super.wait_ready().await;
+        let owned = match Arc::try_unwrap(v3_vpp) {
+            Ok(c) => c,
+            Err(arc) => {
+                tracing::warn!("v3: VppClient still shared, falling back to direct connect");
+                drop(arc);
+                match vpp_api::VppClient::connect(v3_super.socket_path()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("OSPFv3 VPP connect failed: {}", e);
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(e) = daemon_v3::run(v3_cfg, owned, v3_inst_clone).await {
+            tracing::error!("OSPFv3 daemon exited: {}", e);
+        }
+    });
+
+    Some((v3_config.vrf_name, v3_inst))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rx_pkt(sw_if_index: u32) -> RxPacket {
+        RxPacket {
+            sw_if_index,
+            src_addr: Ipv4Addr::new(10, 0, 0, 1),
+            dst_addr: Ipv4Addr::new(224, 0, 0, 5),
+            data: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_by_sw_if_index() {
+        // Two instances: idx 0 owns sw_if_index 7, idx 1 owns 9.
+        let (tx0, mut rx0) = mpsc::channel::<RxPacket>(8);
+        let (tx1, mut rx1) = mpsc::channel::<RxPacket>(8);
+        let senders = vec![tx0, tx1];
+        let mut iface_to_idx = HashMap::new();
+        iface_to_idx.insert(7u32, 0usize);
+        iface_to_idx.insert(9u32, 1usize);
+
+        // Packet for idx 0
+        assert_eq!(
+            dispatch_one(&iface_to_idx, &senders, rx_pkt(7)).await,
+            Some(0),
+        );
+        // Packet for idx 1
+        assert_eq!(
+            dispatch_one(&iface_to_idx, &senders, rx_pkt(9)).await,
+            Some(1),
+        );
+        // Packet on an unknown sw_if_index → dropped silently
+        assert_eq!(
+            dispatch_one(&iface_to_idx, &senders, rx_pkt(42)).await,
+            None,
+        );
+
+        // Both instance receivers should have seen exactly the
+        // packet meant for them.
+        let p0 = rx0.try_recv().expect("idx 0 should have received its pkt");
+        assert_eq!(p0.sw_if_index, 7);
+        assert!(rx0.try_recv().is_err());
+
+        let p1 = rx1.try_recv().expect("idx 1 should have received its pkt");
+        assert_eq!(p1.sw_if_index, 9);
+        assert!(rx1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_when_receiver_dropped_returns_none() {
+        // If the per-instance receiver has been dropped (its task
+        // exited), dispatch_one returns None instead of panicking
+        // — the dispatcher task keeps serving the other instances.
+        let (tx0, rx0) = mpsc::channel::<RxPacket>(1);
+        drop(rx0);
+        let senders = vec![tx0];
+        let mut iface_to_idx = HashMap::new();
+        iface_to_idx.insert(7u32, 0usize);
+
+        assert_eq!(
+            dispatch_one(&iface_to_idx, &senders, rx_pkt(7)).await,
+            None,
+        );
+    }
 }
