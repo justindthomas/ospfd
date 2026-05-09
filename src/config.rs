@@ -242,17 +242,6 @@ pub struct Ipv4AddressConfig {
     pub prefix: u8,
 }
 
-/// An IPv4 address for loopbacks (uses cidr field instead).
-#[derive(Debug, Default, Deserialize)]
-pub struct Ipv4CidrConfig {
-    #[serde(default)]
-    pub address: Option<String>,
-    #[serde(default)]
-    pub cidr: Option<String>,
-    #[serde(default)]
-    pub prefix: Option<u8>,
-}
-
 /// Interface configuration (OSPF-relevant fields).
 #[derive(Debug, Default, Deserialize)]
 pub struct InterfaceConfig {
@@ -376,7 +365,10 @@ pub struct SubInterfaceConfig {
     pub ospf6_neighbors: Vec<Ospf6NeighborConfig>,
 }
 
-/// Loopback interface (OSPF-relevant fields).
+/// Loopback interface (OSPF-relevant fields). Mirrors impd's
+/// `LoopbackInterface` shape: flat `ipv4` / `ipv4_prefix` (not a
+/// `Vec<…>` of CIDR objects) — single-address per loopback,
+/// matching what impd writes to /persistent/config/router.yaml.
 #[derive(Debug, Default, Deserialize)]
 pub struct LoopbackConfig {
     pub name: Option<String>,
@@ -386,7 +378,13 @@ pub struct LoopbackConfig {
     #[serde(default)]
     pub vrf: Option<String>,
     #[serde(default)]
-    pub ipv4: Vec<Ipv4CidrConfig>,
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_prefix: Option<u8>,
     pub ospf_area: Option<serde_yaml::Value>,
     pub ospf_cost: Option<u16>,
     pub ospf_passive: Option<bool>,
@@ -896,27 +894,12 @@ impl OspfDaemonConfig {
                 let area_id = parse_area_id_value(area_val)?;
                 let name = lb.name.as_deref().unwrap_or("").to_string();
 
-                // Loopback addresses may use `cidr` or `address` + `prefix`
-                let (address, prefix_len) = if let Some(first) = lb.ipv4.first() {
-                    if let Some(cidr) = &first.cidr {
-                        let (addr_part, prefix_part) = cidr
-                            .split_once('/')
-                            .unwrap_or((cidr.as_str(), "32"));
-                        (
-                            addr_part.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED),
-                            prefix_part.parse::<u8>().unwrap_or(32),
-                        )
-                    } else if let Some(addr) = &first.address {
-                        (
-                            addr.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED),
-                            first.prefix.unwrap_or(32),
-                        )
-                    } else {
-                        (Ipv4Addr::UNSPECIFIED, 32)
-                    }
-                } else {
-                    (Ipv4Addr::UNSPECIFIED, 32)
-                };
+                let address = lb
+                    .ipv4
+                    .as_deref()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                    .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                let prefix_len = lb.ipv4_prefix.unwrap_or(32);
 
                 interfaces.push(OspfInterfaceConfig {
                     name,
@@ -1452,6 +1435,38 @@ interfaces:
             .find(|i| i.name == "lan.110")
             .expect("lan.110 in OSPFv3 interface list");
         assert_eq!(lan_110.area_id, Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn flat_loopback_ipv4_shape_parses() {
+        // Regression: impd writes `ipv4: "10.255.255.100"` +
+        // `ipv4_prefix: 32` flat on loopbacks (matching its own
+        // `LoopbackInterface` struct). The previous ospfd shape
+        // — `ipv4: Vec<Ipv4CidrConfig>` — failed serde with
+        // "expected a sequence", crashlooping on every router
+        // that had loopbacks. Lock the shape down so we don't
+        // re-introduce the drift.
+        let yaml = r#"
+ospf:
+  enabled: true
+  router_id: "10.0.0.1"
+loopbacks:
+  - instance: 0
+    name: lo0
+    ipv4: "10.255.255.100"
+    ipv4_prefix: 32
+    create_lcp: true
+    ospf_area: 0
+"#;
+        let cfg: RouterConfig = serde_yaml::from_str(yaml).expect("parse loopback yaml");
+        let parsed = OspfDaemonConfig::from_router_yaml(cfg, None).unwrap();
+        let lo0 = parsed
+            .interfaces
+            .iter()
+            .find(|i| i.name == "lo0")
+            .expect("lo0 in OSPFv2 interface list");
+        assert_eq!(lo0.address, "10.255.255.100".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(lo0.prefix_len, 32);
     }
 
     #[test]
