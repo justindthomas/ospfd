@@ -264,12 +264,19 @@ pub async fn run(
     let mut io = match cfg.io_backend {
         V3IoBackend::Raw => crate::io_v3::Ospfv3Io::Raw(RawSocketIoV3::new(io_ifaces)?),
         V3IoBackend::Punt => {
-            let client_path = "/run/ospfd/punt-v6.sock";
+            // Per-VRF: distinct socket path. See the v2 equivalent
+            // in main.rs for the rationale (VPP punt registration
+            // is keyed on (af, proto, port) and the second register
+            // overwrites the first).
+            let client_path = match &cfg.vrf_name {
+                None => "/run/ospfd/punt-v6.sock".to_string(),
+                Some(name) => format!("/run/ospfd/punt-v6@{name}.sock"),
+            };
             let _ = std::fs::create_dir_all("/run/ospfd");
-            let vpp_server_path = register_punt_v6(&vpp, client_path).await?;
+            let vpp_server_path = register_punt_v6(&vpp, &client_path).await?;
             crate::io_v3::Ospfv3Io::Punt(crate::io_punt_v3::PuntSocketIoV3::new(
                 io_ifaces,
-                client_path,
+                &client_path,
                 vpp_server_path,
             )?)
         }

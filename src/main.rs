@@ -825,14 +825,26 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     let mut io = match args.io_backend {
         IoBackend::Raw => ospfd::io::Ospfv2Io::Raw(RawSocketIo::new(io_interfaces)?),
         IoBackend::Punt => {
-            let client_path = "/run/ospfd/punt-v4.sock";
+            // Per-VRF instances must use distinct socket paths.
+            // VPP's `punt_socket_register` is keyed on (af, proto,
+            // port) → socket_path; the second register for the same
+            // tuple OVERWRITES the first inside VPP, so without
+            // per-VRF paths the default-VRF instance silently loses
+            // its punt RX the moment a customer_vrf instance starts.
+            // The Unix-socket bind side has the same hazard:
+            // `remove_file + bind` on a shared path orphans whoever
+            // bound first.
+            let client_path = match &args.vrf {
+                None => "/run/ospfd/punt-v4.sock".to_string(),
+                Some(name) => format!("/run/ospfd/punt-v4@{name}.sock"),
+            };
             // Ensure parent dir exists.
             let _ = std::fs::create_dir_all("/run/ospfd");
-            let vpp_server_path = register_punt_v4(&vpp, client_path).await?;
+            let vpp_server_path = register_punt_v4(&vpp, &client_path).await?;
             ospfd::io::Ospfv2Io::Punt(
                 ospfd::io_punt::PuntSocketIo::new(
                     io_interfaces,
-                    client_path,
+                    &client_path,
                     vpp_server_path,
                 )?,
             )
