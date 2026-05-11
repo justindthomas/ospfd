@@ -594,9 +594,11 @@ fn collect_status_v3(inst: &InstanceV3) -> StatusReply {
             .iter()
             .filter(|e| e.header.ls_type == LsaV3Type::AsExternal)
             .count(),
-        // v3 RIB lives inside daemon_v3 and isn't visible via the
-        // shared instance handle yet.
-        installed_route_count: 0,
+        // v3 RIB itself lives in the daemon task (to keep SPF
+        // lock-free); daemon_v3 mirrors the post-apply size into
+        // `inst.installed_route_count` after every push to ribd,
+        // and we read it here.
+        installed_route_count: inst.installed_route_count,
         summary_addresses,
     }
 }

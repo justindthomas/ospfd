@@ -441,13 +441,25 @@ pub async fn run(
                     "OSPFv3 SPF run"
                 );
                 let (added, deleted) = rib.apply_routes(&routes);
+                let total = rib.route_count();
                 if added > 0 || deleted > 0 {
                     tracing::info!(
                         added,
                         deleted,
-                        total = rib.route_count(),
+                        total,
                         "OSPFv3 SPF cache updated"
                     );
+                }
+                // Mirror the route count into InstanceV3 so the
+                // control socket's status6 reply has the live
+                // number to show. The RIB itself stays in this
+                // task to keep SPF lock-free; only the size leaks
+                // through. Take the mutex briefly here — SPF
+                // already finished and we're outside that critical
+                // section.
+                {
+                    let mut inst = instance.lock().await;
+                    inst.installed_route_count = total;
                 }
                 // Push to ribd. push_v6 splits by sub-type
                 // (intra / inter / ext1 / ext2) into four separate

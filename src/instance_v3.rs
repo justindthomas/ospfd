@@ -182,6 +182,13 @@ pub struct InstanceV3 {
     /// control socket's Status6 reply so the `ospfd query
     /// status6` CLI can show what was configured.
     pub summary_addresses: Vec<crate::config::ParsedSummaryAddress6>,
+    /// Last-applied OSPFv3 RIB size, updated by the daemon task
+    /// every time it pushes a new SPF result to ribd. The RIB
+    /// itself lives in the daemon task so it doesn't have to hold
+    /// the InstanceV3 mutex during SPF; this is the operator-
+    /// visible mirror surfaced through `query status6`. Default 0
+    /// (no SPF has run yet).
+    pub installed_route_count: usize,
 }
 
 impl InstanceV3 {
@@ -196,6 +203,7 @@ impl InstanceV3 {
             redistribute: Vec::new(),
             route_maps: HashMap::new(),
             summary_addresses: Vec::new(),
+            installed_route_count: 0,
         }
     }
 
