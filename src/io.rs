@@ -52,6 +52,18 @@ pub struct IoInterface {
     /// for multicast TX via PUNT_L2. The raw-socket backend ignores
     /// this field since the kernel handles L2 via its own ARP table.
     pub mac_address: [u8; 6],
+    /// 802.1Q outer VLAN tag for sub-interfaces (`None` for parent
+    /// interfaces). PUNT_L2 multicast TX (224.0.0.5 / 224.0.0.6 in
+    /// broadcast or p2p mode) needs the vlan tag pushed into the L2
+    /// frame — VPP doesn't rewrite a PUNT_L2 frame on egress. From
+    /// `sub_outer_vlan_id` in sw_interface_dump. NBMA-mode v2
+    /// happens to dodge this because static neighbors go through
+    /// PUNT_IP4_ROUTED which runs ip4-rewrite; broadcast / p2p hit
+    /// it directly. Parallels the v3 fix in io_v3::IoInterfaceV3.
+    pub outer_vlan_id: Option<u16>,
+    /// 802.1Q inner VLAN tag for QinQ sub-interfaces, `None`
+    /// otherwise. From `sub_inner_vlan_id` in sw_interface_dump.
+    pub inner_vlan_id: Option<u16>,
 }
 
 /// Raw-socket I/O for OSPF packets.

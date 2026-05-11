@@ -1248,12 +1248,30 @@ async fn build_v2_setup(
             "resolved interface",
         );
 
+        // Capture vlan tags so the v2 PUNT_L2 path can push them on
+        // multicast egress (broadcast / p2p modes — NBMA uses
+        // PUNT_IP4_ROUTED which handles vlan-push via ip4-rewrite,
+        // so this only matters when an operator selects broadcast
+        // or p2p on a sub-iface). Parallels the v3 wiring in
+        // spawn_v3_instance below.
+        let outer_vlan_id = if vpp_iface.sub_outer_vlan_id != 0 {
+            Some(vpp_iface.sub_outer_vlan_id)
+        } else {
+            None
+        };
+        let inner_vlan_id = if vpp_iface.sub_inner_vlan_id != 0 {
+            Some(vpp_iface.sub_inner_vlan_id)
+        } else {
+            None
+        };
         io_interfaces.push(IoInterface {
             name: iface.name.clone(),
             sw_if_index: iface.sw_if_index,
             kernel_ifindex,
             address: iface.address,
             mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
+            outer_vlan_id,
+            inner_vlan_id,
         });
     }
 

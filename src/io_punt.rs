@@ -147,12 +147,14 @@ impl PuntSocketTx {
 
         if is_multicast_v4(&packet.dst_addr) {
             let dst_mac = multicast_mac_v4(&packet.dst_addr);
-            let mut frame = Vec::with_capacity(14 + ip_pkt.len());
-            frame.extend_from_slice(&dst_mac);
-            frame.extend_from_slice(&iface.mac_address);
-            frame.extend_from_slice(&[0x08, 0x00]);
-            frame.extend_from_slice(&ip_pkt);
-
+            let frame = build_punt_l2_frame(
+                dst_mac,
+                iface.mac_address,
+                iface.outer_vlan_id,
+                iface.inner_vlan_id,
+                0x0800, // ethertype IPv4
+                &ip_pkt,
+            );
             let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + frame.len());
             dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
             dgram.extend_from_slice(&PUNT_ACTION_L2.to_le_bytes());
@@ -348,14 +350,20 @@ impl PuntSocketIo {
         // module-level doc for why.
         if is_multicast_v4(&packet.dst_addr) {
             // PUNT_L2: enqueue directly at <iface>-output. Need a full
-            // L2 frame (ethernet header + IP packet).
+            // L2 frame (ethernet header + optional 802.1Q tag(s) +
+            // IP packet). VPP does NOT run ip4-rewrite on PUNT_L2,
+            // so for a sub-interface we must push the vlan tag
+            // ourselves or the frame egresses untagged and the
+            // trunked peer drops it onto the native vlan.
             let dst_mac = multicast_mac_v4(&packet.dst_addr);
-            let mut frame = Vec::with_capacity(14 + ip_pkt.len());
-            frame.extend_from_slice(&dst_mac);
-            frame.extend_from_slice(&iface.mac_address);
-            frame.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
-            frame.extend_from_slice(&ip_pkt);
-
+            let frame = build_punt_l2_frame(
+                dst_mac,
+                iface.mac_address,
+                iface.outer_vlan_id,
+                iface.inner_vlan_id,
+                0x0800, // ethertype IPv4
+                &ip_pkt,
+            );
             let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + frame.len());
             dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
             dgram.extend_from_slice(&PUNT_ACTION_L2.to_le_bytes());
@@ -376,6 +384,53 @@ impl PuntSocketIo {
     pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
         self.interfaces.get(&sw_if_index)
     }
+}
+
+/// Build a complete ethernet frame for PUNT_L2 injection: dst MAC,
+/// src MAC, optional 802.1Q (and inner 802.1Q for QinQ) tag(s),
+/// ethertype, payload. Used by both v2 and v3 PUNT_L2 multicast
+/// paths (the v3 builder lives in io_punt_v3.rs but follows the
+/// same layout).
+///
+/// Vlan tagging is required for sub-interfaces because VPP doesn't
+/// run ip{4,6}-rewrite on PUNT_L2 — it trusts the caller to have
+/// constructed the complete frame. The unicast / IP-routed branch
+/// uses ip4-rewrite and gets the tag pushed automatically, which
+/// is why NBMA-mode v2 (unicast hellos) happens to work today
+/// while broadcast / p2p (multicast hellos) needs this explicit
+/// push.
+fn build_punt_l2_frame(
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    outer_vlan_id: Option<u16>,
+    inner_vlan_id: Option<u16>,
+    ethertype: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let tag_bytes = match (outer_vlan_id, inner_vlan_id) {
+        (Some(_), Some(_)) => 8,
+        (Some(_), None) => 4,
+        _ => 0,
+    };
+    let mut frame = Vec::with_capacity(14 + tag_bytes + payload.len());
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    if let Some(outer) = outer_vlan_id {
+        // Outer 802.1Q: TPID 0x8100, TCI = PCP=0, DEI=0, VID =
+        // outer & 0x0fff (12 bits).
+        frame.extend_from_slice(&[0x81, 0x00]);
+        frame.extend_from_slice(&(outer & 0x0fff).to_be_bytes());
+        if let Some(inner) = inner_vlan_id {
+            // Inner 802.1Q: same TPID for OS-side "dot1q outer X
+            // inner Y" sub-iface (switch to 0x88a8 when dot1ad
+            // surfaces).
+            frame.extend_from_slice(&[0x81, 0x00]);
+            frame.extend_from_slice(&(inner & 0x0fff).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&ethertype.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
 /// Returns true if `addr` is in 224.0.0.0/4 (IPv4 multicast).
