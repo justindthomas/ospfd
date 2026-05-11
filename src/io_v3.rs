@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
+use crate::io_punt_v3::ospfv3_compute_checksum_in_place;
 use crate::packet_v3::{ALL_DR_ROUTERS_V6, ALL_SPF_ROUTERS_V6, OSPFV3_IP_PROTO};
 
 #[derive(Debug)]
@@ -126,6 +127,17 @@ impl RawSocketIoV3 {
             std::io::Error::new(std::io::ErrorKind::NotFound, "unknown interface")
         })?;
 
+        // Compute the OSPFv3 checksum over the IPv6 pseudo-header
+        // and the OSPF packet (see io_punt_v3 for the rationale).
+        // SOCK_RAW with IPPROTO_OSPF leaves the checksum to us;
+        // without this, peers running RFC-compliant OSPFv3 reject
+        // the packet and the adjacency never forms.
+        let data = ospfv3_compute_checksum_in_place(
+            &packet.src_addr,
+            &packet.dst_addr,
+            &packet.data,
+        );
+
         // zeroed() for portability — BSD sockaddr_in6 has a leading sin6_len byte.
         let mut dest: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         dest.sin6_family = libc::AF_INET6 as libc::sa_family_t;
@@ -135,8 +147,8 @@ impl RawSocketIoV3 {
         let ret = unsafe {
             libc::sendto(
                 fd.as_raw_fd(),
-                packet.data.as_ptr() as *const libc::c_void,
-                packet.data.len(),
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
                 0,
                 &dest as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,

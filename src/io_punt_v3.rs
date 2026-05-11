@@ -97,10 +97,25 @@ impl PuntSocketIoV3 {
             )
         })?;
 
-        // Build the IPv6 header. The daemon_v3 layer already computed
-        // OSPFv3's own checksum over the pseudo-header + body, so the
-        // `data` field is ready to ship as-is.
-        let ip_pkt = build_ipv6_packet(&packet.src_addr, &packet.dst_addr, &packet.data);
+        // Compute the OSPFv3 checksum over the IPv6 pseudo-header +
+        // the OSPFv3 packet (with the checksum field zeroed during
+        // computation). The daemon's encode_* path emits a fresh
+        // header with checksum=0 and never patches it — putting
+        // the compute here means TX paths share one implementation
+        // and the daemon stays unaware of src/dst plumbing.
+        //
+        // RFC 5340 §2.4 says invalid checksums MUST be dropped. An
+        // OS10 trunk between imp and a VyOS/FRR peer was eating
+        // every multicast frame with checksum=0 — the L2 hop never
+        // reached the receiver. With this fix the frame matches
+        // FRR's expectation and the adjacency forms.
+        let data = ospfv3_compute_checksum_in_place(
+            &packet.src_addr,
+            &packet.dst_addr,
+            &packet.data,
+        );
+
+        let ip_pkt = build_ipv6_packet(&packet.src_addr, &packet.dst_addr, &data);
 
         if is_multicast_v6(&packet.dst_addr) {
             // PUNT_L2: build a full ethernet frame with the multicast
@@ -131,6 +146,63 @@ impl PuntSocketIoV3 {
     pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterfaceV3> {
         self.interfaces.get(&sw_if_index)
     }
+}
+
+/// Byte offset of the `checksum` field in the OSPFv3 header.
+/// Layout (RFC 5340 §A.3.1): version(1) type(1) packet_length(2)
+/// router_id(4) area_id(4) checksum(2) instance_id(1) reserved(1).
+pub(crate) const OSPF_V3_CHECKSUM_OFFSET: usize = 12;
+
+/// Compute the OSPFv3 packet checksum. Per RFC 5340 §2.4 this is the
+/// standard Internet (one's-complement) checksum over the IPv6
+/// pseudo-header followed by the OSPF packet (with the checksum
+/// field set to zero during computation).
+///
+/// IPv6 pseudo-header (RFC 8200 §8.1): 16 src + 16 dst + 4 upper-
+/// layer-length + 3 zeros + 1 next-header (= 40 bytes).
+/// Patch the OSPFv3 checksum field of `packet` over the IPv6
+/// pseudo-header derived from `src`/`dst` and return the resulting
+/// bytes. Used by both the raw-socket and punt TX paths so neither
+/// has to know the daemon's checksum encoding.
+pub(crate) fn ospfv3_compute_checksum_in_place(
+    src: &Ipv6Addr,
+    dst: &Ipv6Addr,
+    packet: &[u8],
+) -> Vec<u8> {
+    let mut data = packet.to_vec();
+    if data.len() >= OSPF_V3_CHECKSUM_OFFSET + 2 {
+        data[OSPF_V3_CHECKSUM_OFFSET] = 0;
+        data[OSPF_V3_CHECKSUM_OFFSET + 1] = 0;
+        let csum = ospfv3_checksum(src, dst, &data);
+        data[OSPF_V3_CHECKSUM_OFFSET..OSPF_V3_CHECKSUM_OFFSET + 2]
+            .copy_from_slice(&csum.to_be_bytes());
+    }
+    data
+}
+
+pub(crate) fn ospfv3_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, ospf: &[u8]) -> u16 {
+    let mut buf: Vec<u8> = Vec::with_capacity(40 + ospf.len());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&(ospf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&[0, 0, 0, 89]); // 3 zeros + next-header OSPF
+    buf.extend_from_slice(ospf);
+
+    // Standard Internet checksum: one's-complement sum of 16-bit
+    // words, then one's-complement.
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        sum += ((buf[i] as u32) << 8) | buf[i + 1] as u32;
+        i += 2;
+    }
+    if i < buf.len() {
+        sum += (buf[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// True if `addr` is an IPv6 multicast address (ff00::/8).
