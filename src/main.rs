@@ -377,6 +377,41 @@ async fn register_punt_v4(
     Ok(server)
 }
 
+/// Return the effective L2 MAC address for an interface, falling
+/// back to the parent's address if the interface itself reports
+/// all-zeros. VPP's `sw_interface_dump` populates `l2_address` only
+/// on the hardware-rooted interface; sub-interfaces (e.g.,
+/// `lan.110`) report `00:00:00:00:00:00` even though their effective
+/// MAC on the wire is inherited from the parent.
+///
+/// PUNT_L2 sends from ospfd build a full L2 frame using
+/// `iface.mac_address` as the source. With a zero source MAC,
+/// switches in the path silently drop the frame (OS10 specifically
+/// rejects ether src 00:00:00:00:00:00). Symptom: imp's OSPFv3
+/// multicast hellos egress VPP cleanly per `lan-tx` trace but never
+/// reach the peer.
+fn effective_l2_address(
+    iface: &vpp_api::generated::interface::SwInterfaceDetails,
+    all: &[vpp_api::generated::interface::SwInterfaceDetails],
+) -> [u8; 6] {
+    if iface.l2_address != [0u8; 6] {
+        return iface.l2_address;
+    }
+    // Sub-interface: walk to the parent via sup_sw_if_index. If we
+    // can't find one (or the parent also has zeros), give up and
+    // return zeros — the caller will at least surface a clear
+    // diagnostic instead of silently mis-tagging the frame.
+    if iface.sup_sw_if_index != iface.sw_if_index {
+        if let Some(parent) = all
+            .iter()
+            .find(|p| p.sw_if_index == iface.sup_sw_if_index)
+        {
+            return parent.l2_address;
+        }
+    }
+    [0u8; 6]
+}
+
 fn get_kernel_ifindex(name: &str) -> anyhow::Result<u32> {
     let path = format!("/sys/class/net/{}/ifindex", name);
     let contents = std::fs::read_to_string(&path)
@@ -1218,7 +1253,7 @@ async fn build_v2_setup(
             sw_if_index: iface.sw_if_index,
             kernel_ifindex,
             address: iface.address,
-            mac_address: vpp_iface.l2_address,
+            mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
         });
     }
 
@@ -1694,7 +1729,7 @@ async fn spawn_v3_instance(
             transmit_delay: ic.transmit_delay,
             priority: ic.priority,
             static_neighbors: ic.static_neighbors.clone(),
-            mac_address: vpp_iface.l2_address,
+            mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
         });
     }
 
