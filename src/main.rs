@@ -1715,6 +1715,19 @@ async fn spawn_v3_instance(
             "point-to-multipoint" => NetworkTypeV3::PointToMultipoint,
             _ => NetworkTypeV3::Broadcast,
         };
+        // Capture VLAN tags for PUNT_L2 multicast TX. VPP exposes
+        // these via sub_outer_vlan_id / sub_inner_vlan_id; both are 0
+        // for parent (non-sub) interfaces. Zero means "no tag".
+        let outer_vlan_id = if vpp_iface.sub_outer_vlan_id != 0 {
+            Some(vpp_iface.sub_outer_vlan_id)
+        } else {
+            None
+        };
+        let inner_vlan_id = if vpp_iface.sub_inner_vlan_id != 0 {
+            Some(vpp_iface.sub_inner_vlan_id)
+        } else {
+            None
+        };
         v3_ifaces.push(daemon_v3::V3InterfaceConfig {
             name: ic.name.clone(),
             sw_if_index: vpp_iface.sw_if_index,
@@ -1730,6 +1743,8 @@ async fn spawn_v3_instance(
             priority: ic.priority,
             static_neighbors: ic.static_neighbors.clone(),
             mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
+            outer_vlan_id,
+            inner_vlan_id,
         });
     }
 

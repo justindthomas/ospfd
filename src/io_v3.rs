@@ -47,6 +47,17 @@ pub struct IoInterfaceV3 {
     /// L2 MAC address. Used only by the punt backend for
     /// synthesizing ethernet headers on PUNT_L2 multicast TX.
     pub mac_address: [u8; 6],
+    /// 802.1Q outer VLAN tag, or `None` for untagged parent
+    /// interfaces. PUNT_L2 hands VPP a fully-formed L2 frame and
+    /// VPP does NOT push the vlan tag on egress (unlike the
+    /// PUNT_IP6_ROUTED / unicast path, which runs through
+    /// ip6-rewrite and gets the tag). Without this field, ff02::5
+    /// hellos egressed lan.110 untagged and trunk peers dropped
+    /// them.
+    pub outer_vlan_id: Option<u16>,
+    /// 802.1Q inner VLAN tag for QinQ sub-interfaces. `None` when
+    /// `sub_number_of_tags < 2`.
+    pub inner_vlan_id: Option<u16>,
 }
 
 pub struct RawSocketIoV3 {

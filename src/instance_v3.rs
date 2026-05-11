@@ -2631,6 +2631,8 @@ mod tests {
             kernel_ifindex: sw_if_index,
             link_local: "fe80::1".parse().unwrap(),
             mac_address: [0; 6],
+            outer_vlan_id: None,
+            inner_vlan_id: None,
         }
     }
 

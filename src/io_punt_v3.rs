@@ -120,10 +120,37 @@ impl PuntSocketIoV3 {
         if is_multicast_v6(&packet.dst_addr) {
             // PUNT_L2: build a full ethernet frame with the multicast
             // MAC derived from the group address per RFC 2464 §7.
+            //
+            // VLAN-tagged sub-interfaces need the 802.1Q (and inner
+            // 802.1Q for QinQ) tag pushed BY US — VPP does not
+            // rewrite a PUNT_L2 frame on egress (it trusts the
+            // caller). The PUNT_IP6_ROUTED path does get vlan-push
+            // via ip6-rewrite, which is why unicast (and v2 NBMA)
+            // worked but multicast on a sub-iface did not: hellos
+            // egressed untagged and trunk peers dropped them onto
+            // the native vlan.
             let dst_mac = multicast_mac_v6(&packet.dst_addr);
-            let mut frame = Vec::with_capacity(14 + ip_pkt.len());
+            let tag_bytes = match (iface.outer_vlan_id, iface.inner_vlan_id) {
+                (Some(_), Some(_)) => 8,
+                (Some(_), None) => 4,
+                _ => 0,
+            };
+            let mut frame = Vec::with_capacity(14 + tag_bytes + ip_pkt.len());
             frame.extend_from_slice(&dst_mac);
             frame.extend_from_slice(&iface.mac_address);
+            if let Some(outer) = iface.outer_vlan_id {
+                // Outer 802.1Q: TPID 0x8100, TCI = PCP=0, DEI=0, VID
+                // = outer (12 bits, masked).
+                frame.extend_from_slice(&[0x81, 0x00]);
+                frame.extend_from_slice(&(outer & 0x0fff).to_be_bytes());
+                if let Some(inner) = iface.inner_vlan_id {
+                    // Inner 802.1Q (same TPID for an OS-side
+                    // "dot1q outer X inner Y" sub-iface; switch to
+                    // 0x88a8 if/when we surface dot1ad sub-ifs).
+                    frame.extend_from_slice(&[0x81, 0x00]);
+                    frame.extend_from_slice(&(inner & 0x0fff).to_be_bytes());
+                }
+            }
             frame.extend_from_slice(&[0x86, 0xdd]); // ethertype IPv6
             frame.extend_from_slice(&ip_pkt);
 

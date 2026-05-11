@@ -52,6 +52,15 @@ pub struct V3InterfaceConfig {
     /// punt backend when synthesizing ethernet headers for
     /// multicast TX via PUNT_L2.
     pub mac_address: [u8; 6],
+    /// 802.1Q outer VLAN id for sub-interfaces, `None` for parent
+    /// interfaces. PUNT_L2 multicast TX needs the vlan tag built
+    /// into the L2 frame — VPP does not rewrite punted L2 frames
+    /// on egress. From `sub_outer_vlan_id` in sw_interface_dump.
+    pub outer_vlan_id: Option<u16>,
+    /// 802.1Q inner VLAN id for QinQ sub-interfaces, `None`
+    /// otherwise. From `sub_inner_vlan_id` in sw_interface_dump
+    /// (zero when `sub_number_of_tags < 2`).
+    pub inner_vlan_id: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +190,8 @@ pub async fn run(
                 kernel_ifindex: ic.kernel_ifindex,
                 link_local: ic.link_local,
                 mac_address: ic.mac_address,
+                outer_vlan_id: ic.outer_vlan_id,
+                inner_vlan_id: ic.inner_vlan_id,
             };
             let sw_if_index = ic.sw_if_index;
             inst.add_interface_full(
@@ -259,6 +270,8 @@ pub async fn run(
             kernel_ifindex: ic.kernel_ifindex,
             link_local: ic.link_local,
             mac_address: ic.mac_address,
+            outer_vlan_id: ic.outer_vlan_id,
+            inner_vlan_id: ic.inner_vlan_id,
         })
         .collect();
     let mut io = match cfg.io_backend {
