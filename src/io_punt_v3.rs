@@ -222,16 +222,22 @@ fn multicast_mac_v6(addr: &Ipv6Addr) -> [u8; 6] {
 fn build_ipv6_packet(src: &Ipv6Addr, dst: &Ipv6Addr, data: &[u8]) -> Vec<u8> {
     let payload_length: u16 = data.len() as u16;
     let mut hdr = Vec::with_capacity(IPV6_HEADER_LEN + data.len());
-    // Version=6 (4b) | Traffic Class (8b) | Flow Label (20b)
-    //   version=6, TC=0xc0 (Internetwork Control, same as v2), flow=0
-    // Byte 0: 0x60 (version 6 high nibble, TC high nibble = 0)
-    // Byte 1: 0x0c (TC low 4 bits = 0xc, flow high 4 bits = 0)
+    // IPv6 first 32-bit word (RFC 8200 §3):
+    //   bits 0..3   = Version
+    //   bits 4..11  = Traffic Class (8 bits)
+    //   bits 12..31 = Flow Label (20 bits)
     //
-    // Actually: the full 32-bit word is 0x60c00000:
-    //   bits 0..3  = 6  (version)
-    //   bits 4..11 = 0xc0 (traffic class = IP Precedence Internet Control)
-    //   bits 12..31 = 0 (flow label)
-    hdr.extend_from_slice(&0x60c0_0000u32.to_be_bytes());
+    // Version=6, Traffic Class=0xc0 (CS6 = Internetwork Control, same
+    // as OSPFv2), Flow Label=0. Packed: 0x6c000000.
+    //   0x6c = 0110 1100   → version=0110=6, TC high nibble=1100
+    //   0x00 = 0000 0000   → TC low nibble=0000, flow label high=0
+    //
+    // Earlier code used 0x60c00000 which encoded TC=0x0c instead of
+    // 0xc0. The traffic class doesn't gate L2 forwarding, but it's
+    // worth getting right so packet captures match peer
+    // implementations and any DSCP-aware policers on the path
+    // (e.g., switch CoS queues) classify the traffic correctly.
+    hdr.extend_from_slice(&0x6c00_0000u32.to_be_bytes());
     hdr.extend_from_slice(&payload_length.to_be_bytes());
     hdr.push(89); // next header = OSPF
     hdr.push(1); // hop limit = 1 (link-local only)
