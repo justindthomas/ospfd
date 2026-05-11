@@ -71,6 +71,16 @@ pub struct NeighborV3 {
     pub pending_lsu: Vec<LsaV3Raw>,
     /// Whether we need to send a LSR for our request_list.
     pub lsr_pending: bool,
+    /// Last time we sent an LSR for this neighbor's request_list,
+    /// for the RFC 5340 §10.9 retransmit. None until the first
+    /// LSR fires; set to `Instant::now()` on every TX. Combined
+    /// with the interface's `retransmit_interval`, this drives
+    /// periodic resends until the request_list drains — without
+    /// it, a dropped LSU response leaves the neighbor stuck in
+    /// Loading forever (verified on jt-router 2026-05-11 where
+    /// 2 of 10 requested LSAs never arrived and the LSR was
+    /// never resent).
+    pub last_lsr_sent: Option<Instant>,
     /// Slave only: set when the slave has finished its DD exchange
     /// and must emit one final DD echo to the master before the
     /// neighbor state transitions fully (RFC 2328 §10.8). Cleared on
@@ -2082,6 +2092,7 @@ impl InstanceV3 {
     pub fn emit_pending_lsdb_packets(&mut self) -> Vec<TxPacketV3> {
         let router_id = self.router_id;
         let mut out = Vec::new();
+        let now = Instant::now();
         for iface in self.interfaces.values_mut() {
             if iface.state == InterfaceStateV3::Down {
                 continue;
@@ -2090,6 +2101,11 @@ impl InstanceV3 {
             let instance_id = iface.instance_id;
             let sw_if_index = iface.io.sw_if_index;
             let src_addr = iface.io.link_local;
+            // RFC 5340 §10.9 retransmit interval. The interface
+            // carries the configured value (typically 5s).
+            let rxmt = std::time::Duration::from_secs(
+                iface.retransmit_interval.max(1) as u64,
+            );
 
             for neighbor in iface.neighbors.values_mut() {
                 if neighbor.state < NeighborStateV3::Exchange {
@@ -2097,9 +2113,22 @@ impl InstanceV3 {
                 }
                 let dst = neighbor.link_local;
 
-                // 1. LSR — drain request_list (we send one LSR with all)
-                if neighbor.lsr_pending && !neighbor.request_list.is_empty() {
+                // 1. LSR — drain request_list. Re-send when either
+                //    (a) the request_list was just built / refreshed
+                //    (`lsr_pending`), or (b) more than `RxmtInterval`
+                //    has elapsed since the last LSR went out and the
+                //    request_list still has entries. RFC 5340 §10.9
+                //    requires retransmission until the request list
+                //    drains; without it, a single dropped LSU
+                //    response strands the neighbor in Loading.
+                let lsr_due = !neighbor.request_list.is_empty()
+                    && (neighbor.lsr_pending
+                        || neighbor
+                            .last_lsr_sent
+                            .map_or(true, |t| now.duration_since(t) >= rxmt));
+                if lsr_due {
                     neighbor.lsr_pending = false;
+                    neighbor.last_lsr_sent = Some(now);
                     let requests: Vec<LsRequestV3> = neighbor
                         .request_list
                         .iter()
@@ -2383,6 +2412,7 @@ impl InstanceV3 {
                 pending_acks: Vec::new(),
                 pending_lsu: Vec::new(),
                 lsr_pending: false,
+                last_lsr_sent: None,
                 dd_response_pending: false,
                 dd_send_final: false,
                 dd_peer_done: false,
@@ -3012,6 +3042,7 @@ mod tests {
                 pending_acks: Vec::new(),
                 pending_lsu: Vec::new(),
                 lsr_pending: false,
+                last_lsr_sent: None,
                 dd_send_final: false,
                 dd_peer_done: false,
             },
@@ -3423,6 +3454,7 @@ mod tests {
                 pending_acks: Vec::new(),
                 pending_lsu: Vec::new(),
                 lsr_pending: false,
+                last_lsr_sent: None,
                 dd_response_pending: false,
                 dd_send_final: false,
                 dd_peer_done: false,
@@ -3632,6 +3664,83 @@ mod tests {
         assert!(
             inst.interfaces[&1].neighbors[&peer].request_list.is_empty()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // LSR retransmit on RxmtInterval expiry (RFC 5340 §10.9)
+    // ------------------------------------------------------------------
+
+    /// `emit_pending_lsdb_packets` fires an LSR for `request_list` once
+    /// when `lsr_pending` is set, then again every `RxmtInterval`
+    /// while `request_list` remains non-empty. Without the
+    /// retransmit, a dropped LSU response leaves the neighbor stuck
+    /// in Loading forever (observed on jt-router 2026-05-11).
+    #[test]
+    fn test_lsr_retransmits_on_rxmt_interval() {
+        let self_rid = Ipv4Addr::new(1, 1, 1, 1);
+        let peer = Ipv4Addr::new(2, 2, 2, 2);
+        let mut inst = inst_with_iface(self_rid, 1);
+        // Use a short RxmtInterval so the test doesn't sleep too long.
+        let iface = inst.interfaces.get_mut(&1).unwrap();
+        iface.retransmit_interval = 1;
+        // The fixture leaves the interface in Waiting; bump it to
+        // Backup so `emit_pending_lsdb_packets` traverses it.
+        iface.state = InterfaceStateV3::Backup;
+        add_neighbor(&mut inst, 1, peer, NeighborStateV3::Loading);
+
+        let needed = LsaV3Header {
+            ls_age: 0,
+            ls_type: LsaV3Type::Router,
+            link_state_id: Ipv4Addr::UNSPECIFIED,
+            advertising_router: peer,
+            ls_sequence_number: INITIAL_SEQUENCE_NUMBER,
+            ls_checksum: 0,
+            length: LSA_V3_HEADER_LEN as u16 + 4,
+        };
+        let n = inst.interfaces.get_mut(&1).unwrap()
+            .neighbors.get_mut(&peer).unwrap();
+        n.request_list.push(needed);
+        n.lsr_pending = true;
+
+        // First call: lsr_pending is set, LSR fires, last_lsr_sent
+        // is recorded, lsr_pending cleared.
+        let pkts = inst.emit_pending_lsdb_packets();
+        let lsr_count = pkts.iter().filter(|p| {
+            // L2 + IPv6 header offsets are 14 + 40; OSPFv3 byte 1
+            // is the packet type (3 = LinkStateRequest).
+            // OSPFv3 header byte 1 is the packet type (3 = LSR).
+            // build_v3_packet emits header-first, no L2/L3 wrap.
+            p.data.get(1) == Some(&3u8)
+        }).count();
+        assert_eq!(lsr_count, 1, "first emit should send an LSR");
+        assert!(
+            !inst.interfaces[&1].neighbors[&peer].lsr_pending,
+            "lsr_pending should be cleared after send"
+        );
+
+        // Second call immediately after: request_list still non-empty,
+        // but RxmtInterval hasn't elapsed → no LSR sent.
+        let pkts2 = inst.emit_pending_lsdb_packets();
+        let lsr_count2 = pkts2.iter().filter(|p| {
+            // OSPFv3 header byte 1 is the packet type (3 = LSR).
+            // build_v3_packet emits header-first, no L2/L3 wrap.
+            p.data.get(1) == Some(&3u8)
+        }).count();
+        assert_eq!(lsr_count2, 0, "no retransmit before RxmtInterval");
+
+        // Wind last_lsr_sent back to simulate RxmtInterval elapsing,
+        // then verify the retransmit fires.
+        let backdated = Instant::now() - Duration::from_secs(5);
+        inst.interfaces.get_mut(&1).unwrap()
+            .neighbors.get_mut(&peer).unwrap()
+            .last_lsr_sent = Some(backdated);
+        let pkts3 = inst.emit_pending_lsdb_packets();
+        let lsr_count3 = pkts3.iter().filter(|p| {
+            // OSPFv3 header byte 1 is the packet type (3 = LSR).
+            // build_v3_packet emits header-first, no L2/L3 wrap.
+            p.data.get(1) == Some(&3u8)
+        }).count();
+        assert_eq!(lsr_count3, 1, "retransmit should fire after RxmtInterval");
     }
 
     // ------------------------------------------------------------------
