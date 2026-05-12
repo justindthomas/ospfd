@@ -346,6 +346,58 @@ impl OspfInstance {
         let area_id = self.interfaces[iface_idx].area_id;
         let my_router_id = self.router_id;
 
+        // Stale-self-LSA recovery (mirrors the v3 path in
+        // instance_v3.rs::process_packet). When we restart we
+        // originate at INITIAL_SEQUENCE_NUMBER, but peers may have
+        // cached a higher-seq copy of our LSA from the previous
+        // process. RFC 2328 §13.4 wants us to bump our seq past the
+        // peer's and re-flood so our new LSA wins. Without this
+        // step, any change to the LSA body across a restart
+        // (flag bits, link list, etc.) silently fails to propagate
+        // — the peer keeps using its stale copy until MaxAge.
+        let mut bumped_self_lsa = false;
+        for lsa_hdr in &dd.lsa_headers {
+            if lsa_hdr.advertising_router != my_router_id {
+                continue;
+            }
+            let key = lsa_hdr.key();
+            let (our_seq, bumped) = if lsa_hdr.ls_type == LsaType::AsExternal {
+                let s = self
+                    .as_external_lsdb
+                    .get(&key)
+                    .map(|e| e.lsa.header.ls_sequence_number);
+                let b = self
+                    .as_external_lsdb
+                    .bump_seq(&key, lsa_hdr.ls_sequence_number);
+                (s, b)
+            } else if let Some(area) = self.areas.get_mut(&area_id) {
+                let s = area.lsdb.get(&key).map(|e| e.lsa.header.ls_sequence_number);
+                let b = area.lsdb.bump_seq(&key, lsa_hdr.ls_sequence_number);
+                (s, b)
+            } else {
+                continue;
+            };
+            if bumped {
+                tracing::info!(
+                    ls_type = ?lsa_hdr.ls_type,
+                    ls_id = %lsa_hdr.link_state_id,
+                    local_seq = format!("{:#x}", our_seq.unwrap_or(0)),
+                    peer_seq = format!("{:#x}", lsa_hdr.ls_sequence_number),
+                    "OSPFv2 stale self-LSA detected, bumping local seq",
+                );
+                bumped_self_lsa = true;
+            }
+        }
+        if bumped_self_lsa {
+            // Re-originate every self-LSA whose seq we just
+            // touched. originate_router_lsas does
+            // `existing.seq + 1` so the new LSA strictly beats the
+            // peer's cache. Failing to do this leaves the peer on
+            // its stale copy until MaxAge (1h).
+            let _ = self.originate_router_lsas();
+            self.schedule_spf();
+        }
+
         // Phase 1: state machine update (mut borrow on neighbor).
         // Pre-fetch the existing_hdr for each DD-listed LSA outside the
         // neighbor mut borrow (so we can cross-check against area + AS-ext LSDBs).

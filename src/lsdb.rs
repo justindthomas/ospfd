@@ -62,6 +62,24 @@ impl Lsdb {
         self.entries.get(key)
     }
 
+    /// Bump the sequence number of an existing entry to `new_seq`
+    /// without re-encoding the body. Used by stale-self-LSA
+    /// recovery: when we restart, peers may have cached a higher
+    /// seq of our LSA than we just originated. Setting our local
+    /// entry to the peer's seq + a subsequent `originate_*` call
+    /// (which does `existing_seq + 1`) overrides the peer's stale
+    /// copy without waiting for MaxAge. Returns `true` when the
+    /// entry existed and was strictly bumped.
+    pub fn bump_seq(&mut self, key: &LsaKey, new_seq: i32) -> bool {
+        if let Some(existing) = self.entries.get_mut(key) {
+            if existing.lsa.header.ls_sequence_number < new_seq {
+                existing.lsa.header.ls_sequence_number = new_seq;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get all LSAs in the database.
     pub fn all_entries(&self) -> impl Iterator<Item = (&LsaKey, &LsdbEntry)> {
         self.entries.iter()
