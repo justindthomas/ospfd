@@ -1007,6 +1007,15 @@ impl OspfInstance {
     pub fn originate_router_lsas(&mut self) -> Vec<(Ipv4Addr, Lsa)> {
         let area_ids: Vec<Ipv4Addr> = self.areas.keys().copied().collect();
         let is_abr = self.is_abr();
+        // We're an ASBR whenever we have any active redistribute
+        // entry — `originate_external_lsas` emits the Type-5 LSAs
+        // for those routes, and the Router-LSA's E bit is the
+        // companion signal that lets peers compute SPF paths to us
+        // as an ASBR (RFC 2328 §16.4). Without the E flag, peer
+        // routers know about the Type-5 LSAs we originate but refuse
+        // to install them — they can't resolve the advertising
+        // router via an intra/inter-area path.
+        let is_asbr = !self.redistribute.is_empty();
         let mut originated = Vec::new();
 
         for area_id in area_ids {
@@ -1101,8 +1110,17 @@ impl OspfInstance {
                 continue;
             }
 
-            // Set the B (border router) flag if we are an ABR
-            let flags = if is_abr { RouterLsa::B_FLAG } else { 0 };
+            // Set the B (border router) flag if we are an ABR and
+            // the E (AS boundary router) flag if we are an ASBR.
+            // Both flags coexist on the same router-LSA in OSPFv2
+            // (RFC 2328 §A.4.2) — a router may be both at once.
+            let mut flags = 0u8;
+            if is_abr {
+                flags |= RouterLsa::B_FLAG;
+            }
+            if is_asbr {
+                flags |= RouterLsa::E_FLAG;
+            }
 
             if let Some(area) = self.areas.get_mut(&area_id) {
                 let lsa = area.lsdb.originate_router_lsa(
@@ -2262,8 +2280,18 @@ impl OspfInstance {
                 new = new.redistribute.len(),
                 "reload: redistribute replaced"
             );
+            let was_asbr = !self.redistribute.is_empty();
+            let is_asbr = !new.redistribute.is_empty();
             self.redistribute = new.redistribute.clone();
             changed = true;
+            // Flip ASBR state means the Router-LSA's E flag needs
+            // refreshing in every area we participate in so peers
+            // can (or can no longer) compute SPF paths to us as an
+            // ASBR — otherwise our Type-5 LSAs are advertised but
+            // never installed downstream.
+            if was_asbr != is_asbr {
+                router_lsa_dirty = true;
+            }
         }
 
         if router_lsa_dirty {
@@ -2666,6 +2694,95 @@ mod tests {
         assert_eq!(stubs.len(), 1, "one host stub for our own /32");
         assert_eq!(stubs[0].link_id, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(stubs[0].link_data, Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    /// An instance with at least one redistribute entry must set
+    /// the E (AS boundary router) flag in every Router-LSA it
+    /// originates. Without this, peers see our Type-5 LSAs in their
+    /// LSDB but refuse to install them (RFC 2328 §16.4): SPF can't
+    /// classify the advertising router as an ASBR via the Router-
+    /// LSA, so the Type-5's forwarding address resolution fails.
+    #[test]
+    fn router_lsa_sets_e_flag_when_redistribute_configured() {
+        use crate::config::{RedistributeConfig, RedistributeSource};
+        use crate::packet::lsa::{LsaBody, RouterLsa};
+
+        let mut config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
+            router_id: Ipv4Addr::new(10, 100, 0, 18),
+            reference_bandwidth: 100,
+            spf_delay_ms: 50,
+            spf_holdtime_ms: 200,
+            spf_max_holdtime_ms: 5000,
+            interfaces: vec![crate::config::OspfInterfaceConfig {
+                name: "lan.110".to_string(),
+                address: Ipv4Addr::new(192, 168, 37, 5),
+                prefix_len: 24,
+                area_id: Ipv4Addr::UNSPECIFIED,
+                cost: 10,
+                passive: false,
+                network_type: "broadcast".to_string(),
+                hello_interval: 10,
+                dead_interval: 40,
+                retransmit_interval: 5,
+                priority: 1,
+                auth_key: crate::packet::auth::AuthKey::None,
+                static_neighbors: Vec::new(),
+            }],
+            redistribute: vec![RedistributeConfig {
+                source: RedistributeSource::Connected,
+                metric: 20,
+                metric_type: 2,
+                route_map: None,
+            }],
+            areas: Vec::new(),
+            distance: None,
+            distance_intra: None,
+            distance_inter: None,
+            distance_external: None,
+            default_originate: false,
+            default_originate_metric: 1,
+            default_originate_metric_type: 2,
+            summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
+        };
+        let mut instance = OspfInstance::new(&config);
+        instance.interfaces[0].state = InterfaceState::Waiting;
+
+        let lsas = instance.originate_router_lsas();
+        assert!(!lsas.is_empty(), "should originate at least one Router-LSA");
+        for (_, lsa) in &lsas {
+            let LsaBody::Router(rlsa) = &lsa.body else {
+                panic!("expected Router-LSA");
+            };
+            assert!(
+                rlsa.flags & RouterLsa::E_FLAG != 0,
+                "E flag must be set when redistribute is configured (flags=0x{:02x})",
+                rlsa.flags,
+            );
+            assert!(
+                rlsa.flags & RouterLsa::B_FLAG == 0,
+                "B flag must NOT be set on a single-area instance (flags=0x{:02x})",
+                rlsa.flags,
+            );
+        }
+
+        // Toggle redistribute off via reload_config — the LSA's E
+        // flag must clear on the next origination.
+        config.redistribute.clear();
+        let _ = instance.reload_config(&config);
+        let lsas = instance.originate_router_lsas();
+        for (_, lsa) in &lsas {
+            let LsaBody::Router(rlsa) = &lsa.body else {
+                panic!("expected Router-LSA");
+            };
+            assert!(
+                rlsa.flags & RouterLsa::E_FLAG == 0,
+                "E flag must clear when redistribute drops to empty (flags=0x{:02x})",
+                rlsa.flags,
+            );
+        }
     }
 
     /// Verifies multi-DD paging: when our LSDB has more than
