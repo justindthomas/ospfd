@@ -265,11 +265,35 @@ impl RedistributeEntry {
     }
 }
 
-/// An IPv4 address assigned to an interface.
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct Ipv4AddressConfig {
-    pub address: String,
-    pub prefix: u8,
+/// An IPv4 address assigned to an interface. impd writes a CIDR
+/// string today; the legacy `{address, prefix}` map is also
+/// accepted via the untagged enum so existing yaml round-trips.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Ipv4AddressConfig {
+    Cidr(String),
+    Split { address: String, prefix: u8 },
+}
+
+impl Default for Ipv4AddressConfig {
+    fn default() -> Self {
+        Ipv4AddressConfig::Cidr(String::new())
+    }
+}
+
+impl Ipv4AddressConfig {
+    /// Parse into (address, prefix). Returns None when the CIDR
+    /// string is malformed.
+    pub fn as_pair(&self) -> Option<(&str, u8)> {
+        match self {
+            Ipv4AddressConfig::Cidr(s) => {
+                let (a, p) = s.split_once('/')?;
+                let plen: u8 = p.parse().ok()?;
+                Some((a, plen))
+            }
+            Ipv4AddressConfig::Split { address, prefix } => Some((address.as_str(), *prefix)),
+        }
+    }
 }
 
 /// Interface configuration (OSPF-relevant fields).
@@ -845,15 +869,13 @@ impl OspfDaemonConfig {
                     let area_id = parse_area_id_value(area_val)?;
                     let name = iface.name.as_deref().unwrap_or("").to_string();
 
-                    // Use the first IPv4 address on the interface
-                    let (address, prefix_len) = if let Some(first) = iface.ipv4.first() {
-                        (
-                            first.address.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::UNSPECIFIED),
-                            first.prefix,
-                        )
-                    } else {
-                        (Ipv4Addr::UNSPECIFIED, 24)
-                    };
+                    // Use the first IPv4 address on the interface.
+                    let (address, prefix_len) = iface
+                        .ipv4
+                        .first()
+                        .and_then(|a| a.as_pair())
+                        .and_then(|(a, p)| a.parse::<Ipv4Addr>().ok().map(|addr| (addr, p)))
+                        .unwrap_or((Ipv4Addr::UNSPECIFIED, 24));
 
                     let passive = iface.ospf_passive.unwrap_or(config.ospf.passive_default);
                     let auth_key = parse_auth_key(
