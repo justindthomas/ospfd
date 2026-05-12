@@ -1068,6 +1068,13 @@ impl OspfInstance {
         // to install them — they can't resolve the advertising
         // router via an intra/inter-area path.
         let is_asbr = !self.redistribute.is_empty();
+        tracing::info!(
+            vrf = ?self.vrf_name,
+            redistribute_len = self.redistribute.len(),
+            is_abr,
+            is_asbr,
+            "originate_router_lsas: computing flags",
+        );
         let mut originated = Vec::new();
 
         for area_id in area_ids {
