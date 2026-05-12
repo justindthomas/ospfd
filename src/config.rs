@@ -1528,7 +1528,7 @@ interfaces:
           - "2001:db8:37::5/64"
         create_lcp: true
         ospf_area: 0
-        ospf6_area: 0
+        ospf3_area: 0
         {extra}
 "#
         );
