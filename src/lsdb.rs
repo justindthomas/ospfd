@@ -237,6 +237,14 @@ impl Lsdb {
             INITIAL_SEQUENCE_NUMBER
         };
 
+        tracing::info!(
+            router_id = %router_id,
+            flags_in = format!("{:#04x}", flags),
+            seq = format!("{:#x}", seq),
+            link_count = links.len(),
+            "lsdb::originate_router_lsa: building",
+        );
+
         let body = RouterLsa { flags, links };
 
         // Calculate body size
