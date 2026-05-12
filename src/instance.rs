@@ -389,12 +389,24 @@ impl OspfInstance {
             }
         }
         if bumped_self_lsa {
-            // Re-originate every self-LSA whose seq we just
-            // touched. originate_router_lsas does
-            // `existing.seq + 1` so the new LSA strictly beats the
-            // peer's cache. Failing to do this leaves the peer on
-            // its stale copy until MaxAge (1h).
-            let _ = self.originate_router_lsas();
+            // Bumping the LSDB entry's seq is enough on its own —
+            // the existing origination paths (neighbor_reached_full
+            // in process_lsu, periodic_maintenance, reload_config)
+            // will pick up the bumped seq and emit `existing.seq + 1`
+            // when they next run, with the correct interface state.
+            //
+            // Re-originating directly here would be wrong: at the
+            // time we receive an Exchange-phase DD, neighbors are
+            // still in Exchange (not Full), so `has_full_adj` is
+            // false and `originate_router_lsas` would emit a
+            // StubNetwork link instead of the TransitNetwork the
+            // Full-state path produces — and the StubNetwork LSA
+            // is what would then win against the peer's cache,
+            // hiding us from SPF's ASBR-reachability check.
+            //
+            // Schedule SPF since the bumped seq counts as a
+            // self-LSA change as far as the local SPF view is
+            // concerned.
             self.schedule_spf();
         }
 
