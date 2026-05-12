@@ -782,7 +782,7 @@ impl OspfInstance {
     /// the LSAs are self-originated)
     /// `from_router`: the router that sent us the LSAs (or our router ID for
     /// self-originated)
-    fn flood_lsas_to_others(
+    pub fn flood_lsas_to_others(
         &self,
         input_iface_idx: usize,
         from_router: Ipv4Addr,
@@ -2102,12 +2102,40 @@ impl OspfInstance {
                 total_purged += purged.len();
             }
         }
+        // Same purge sweep for AS-external LSAs (Type 5). The
+        // re-origination decision for Type-5 lives on the daemon
+        // side (it needs to walk VPP to re-discover externals) —
+        // see `as_external_refresh_due` and the daemon's
+        // lsdb_tick handler.
+        let ext_purged = self.as_external_lsdb.flush_max_age();
+        if !ext_purged.is_empty() {
+            tracing::info!(
+                count = ext_purged.len(),
+                "purged MaxAge AS-external LSAs",
+            );
+            total_purged += ext_purged.len();
+        }
         if total_purged > 0 {
-            tracing::info!(count = total_purged, "purged MaxAge LSAs");
             changed = true;
         }
 
         changed
+    }
+
+    /// True when any self-originated AS-external LSA (Type 5) has
+    /// aged past LSRefreshTime and is due for re-origination. Used
+    /// by the daemon's periodic tick to gate the externals
+    /// re-discovery + re-originate path — that path is expensive
+    /// (one VPP API dump per call) so we only run it when an LSA
+    /// actually needs to flood.
+    ///
+    /// Without this hook the Type-5 refresh path never fires from
+    /// inside `periodic_maintenance` (which only sees area LSDBs),
+    /// and self-originated externals age to MaxAge (1h) and get
+    /// flushed from every peer's LSDB — silently dropping every
+    /// redistributed prefix from downstream routing tables.
+    pub fn as_external_refresh_due(&self) -> bool {
+        !self.as_external_lsdb.self_originated_due_for_refresh().is_empty()
     }
 
     /// Check all neighbors for inactivity timer expiry.

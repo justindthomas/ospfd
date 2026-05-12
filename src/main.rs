@@ -962,12 +962,68 @@ async fn run_v2_instance(
             }
 
             _ = lsdb_tick.tick() => {
-                let mut inst = instance.lock().await;
-                let mut responses = Vec::new();
-                if inst.periodic_maintenance(&mut responses) {
-                    inst.schedule_spf();
+                // Refresh-due check is cheap (one LSDB scan); cache it
+                // before dropping the lock so we don't hold it across
+                // the expensive VPP API dump.
+                let (refresh_ext, periodic_changed) = {
+                    let mut inst = instance.lock().await;
+                    let mut responses = Vec::new();
+                    let changed = inst.periodic_maintenance(&mut responses);
+                    if changed {
+                        inst.schedule_spf();
+                    }
+                    let ext_due = inst.as_external_refresh_due();
+                    send_responses(&io, &mut inst, responses);
+                    (ext_due, changed)
+                };
+                let _ = periodic_changed;
+
+                // AS-external (Type 5) refresh path. Sits outside
+                // periodic_maintenance because re-discovering
+                // externals from VPP requires the binary API client,
+                // which periodic_maintenance has no handle for.
+                // Without this loop, self-originated Type-5 LSAs
+                // age to MaxAge (1h) and get flushed from every
+                // peer's LSDB — silently dropping every redistributed
+                // prefix from downstream routing tables once an hour.
+                if refresh_ext {
+                    // Re-snapshot the enrolled interface set; sub-iface
+                    // adds/removes since the last tick should be
+                    // visible to the externals discovery walk.
+                    let enrolled: std::collections::HashSet<u32> = {
+                        let inst = instance.lock().await;
+                        inst.interfaces
+                            .iter()
+                            .map(|i| i.sw_if_index)
+                            .filter(|s| *s != 0)
+                            .collect()
+                    };
+                    let externals =
+                        discover_externals_v4(&vpp, &enrolled, config.table_id_v4).await;
+                    let summaries = config.summary_addresses.clone();
+                    let mut inst = instance.lock().await;
+                    let ext_lsas = inst.originate_external_lsas(
+                        &config.redistribute,
+                        &externals,
+                        &summaries,
+                    );
+                    if !ext_lsas.is_empty() {
+                        tracing::info!(
+                            vrf = ?config.vrf_name,
+                            count = ext_lsas.len(),
+                            "refreshed self-originated AS-external LSAs",
+                        );
+                        let router_id = inst.router_id;
+                        let mut responses = Vec::new();
+                        inst.flood_lsas_to_others(
+                            usize::MAX,
+                            router_id,
+                            &ext_lsas,
+                            &mut responses,
+                        );
+                        send_responses(&io, &mut inst, responses);
+                    }
                 }
-                send_responses(&io, &mut inst, responses);
             }
 
             _ = iface_refresh.tick() => {
