@@ -237,14 +237,6 @@ impl Lsdb {
             INITIAL_SEQUENCE_NUMBER
         };
 
-        tracing::info!(
-            router_id = %router_id,
-            flags_in = format!("{:#04x}", flags),
-            seq = format!("{:#x}", seq),
-            link_count = links.len(),
-            "lsdb::originate_router_lsa: building",
-        );
-
         let body = RouterLsa { flags, links };
 
         // Calculate body size
@@ -268,19 +260,7 @@ impl Lsdb {
 
         // Encode to compute checksum, then re-parse to get correct checksum
         let encoded = lsa.encode();
-        let body_byte_after_header_offset_1 = encoded.get(21).copied().unwrap_or(0);
-        tracing::info!(
-            encoded_len = encoded.len(),
-            body_flag_byte = format!("{:#04x}", body_byte_after_header_offset_1),
-            "lsdb::originate_router_lsa: encoded",
-        );
         let lsa_with_checksum = Lsa::parse(&encoded).expect("re-parse own LSA");
-        if let LsaBody::Router(ref r) = lsa_with_checksum.body {
-            tracing::info!(
-                parsed_flags = format!("{:#04x}", r.flags),
-                "lsdb::originate_router_lsa: re-parsed flags",
-            );
-        }
 
         self.install(lsa_with_checksum.clone());
         lsa_with_checksum

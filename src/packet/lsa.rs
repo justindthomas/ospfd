@@ -268,8 +268,19 @@ impl RouterLsa {
                 got: data.len(),
             });
         }
-        // Byte 0: reserved (0), Byte 1: V|E|B flags, Bytes 2-3: # links
-        let flags = data[1];
+        // RFC 2328 §A.4.2 router-LSA body layout:
+        //   Byte 0: |0 0 0 0 0|V|E|B|   (flags)
+        //   Byte 1: reserved (0)
+        //   Bytes 2-3: # links
+        //
+        // Earlier code had bytes 0/1 swapped (flags at byte 1, reserved
+        // at byte 0). That round-tripped fine internally but every
+        // RFC-conformant peer (FRR/VyOS, IOS, etc.) read flags as 0
+        // regardless of what we set — making us look like neither an
+        // ABR nor an ASBR even when we were redistributing externals,
+        // so Type-5 LSAs we originated were ignored by every peer's
+        // SPF (RFC 2328 §16.4 ASBR reachability rule).
+        let flags = data[0];
         let num_links = u16::from_be_bytes([data[2], data[3]]) as usize;
 
         // Bound by buffer size — `num_links` is attacker-controlled.
@@ -291,8 +302,11 @@ impl RouterLsa {
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.push(0); // reserved
+        // RFC 2328 §A.4.2: byte 0 carries the V|E|B flags, byte 1 is
+        // reserved. (See the matching note in parse() for the
+        // backstory on why this ordering was wrong for a while.)
         buf.push(self.flags);
+        buf.push(0); // reserved
         buf.extend_from_slice(&(self.links.len() as u16).to_be_bytes());
         for link in &self.links {
             link.encode(buf);
@@ -635,6 +649,33 @@ mod tests {
         assert_eq!(parsed.links.len(), 2);
         assert_eq!(parsed.links[0].link_type, RouterLinkType::StubNetwork);
         assert_eq!(parsed.links[0].metric, 10);
+    }
+
+    /// Wire-format test: pin the byte layout per RFC 2328 §A.4.2 so a
+    /// future "looks symmetric so should round-trip" refactor can't
+    /// re-introduce the bytes-0/1-swapped bug that hid the E flag from
+    /// every peer's SPF for months.
+    ///
+    ///   Byte 0: |0 0 0 0 0|V|E|B|   (flags — E_FLAG=0x02, B_FLAG=0x04)
+    ///   Byte 1: reserved (0)
+    ///   Bytes 2-3: # links (big endian)
+    #[test]
+    fn router_lsa_wire_format_matches_rfc_2328() {
+        let lsa = RouterLsa {
+            flags: RouterLsa::E_FLAG | RouterLsa::B_FLAG,
+            links: vec![RouterLink {
+                link_id: Ipv4Addr::new(10, 0, 0, 0),
+                link_data: Ipv4Addr::new(255, 255, 255, 0),
+                link_type: RouterLinkType::StubNetwork,
+                num_tos: 0,
+                metric: 10,
+            }],
+        };
+        let mut buf = Vec::new();
+        lsa.encode(&mut buf);
+        assert_eq!(buf[0], 0x06, "flags byte must be at offset 0");
+        assert_eq!(buf[1], 0x00, "reserved byte must be at offset 1");
+        assert_eq!(&buf[2..4], &[0x00, 0x01], "# links big-endian at 2..4");
     }
 
     #[test]
