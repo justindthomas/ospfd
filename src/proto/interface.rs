@@ -62,7 +62,7 @@ pub enum NetworkType {
 }
 
 /// A statically-configured NBMA neighbor. Populated from
-/// `ospf_neighbors`. in the config file at interface creation time.
+/// `ospf.neighbors` in the config file at interface creation time.
 #[derive(Debug, Clone)]
 pub struct StaticNeighbor {
     /// IP address — used as unicast Hello destination and as the
@@ -117,7 +117,7 @@ pub struct OspfInterface {
     pub passive: bool,
     /// Statically-configured neighbors. Only used for
     /// `NetworkType::NonBroadcast` — pre-populated from
-    /// `ospf_neighbors`. in the config file at interface creation.
+    /// `ospf.neighbors` in the config file at interface creation.
     /// Hellos are unicast to each entry's address.
     pub static_neighbors: Vec<StaticNeighbor>,
     /// Elected Designated Router (IP address).

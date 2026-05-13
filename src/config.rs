@@ -309,48 +309,16 @@ pub struct InterfaceConfig {
     pub vrf: Option<String>,
     #[serde(default)]
     pub ipv4: Vec<Ipv4AddressConfig>,
-    pub ospf_area: Option<serde_yaml::Value>,
-    pub ospf_cost: Option<u16>,
-    pub ospf_passive: Option<bool>,
-    pub ospf_network_type: Option<String>,
-    pub ospf_hello_interval: Option<u16>,
-    pub ospf_dead_interval: Option<u32>,
-    pub ospf_retransmit_interval: Option<u16>,
-    pub ospf_priority: Option<u8>,
-    /// Static NBMA neighbor list. Only honored when
-    /// `ospf_network_type` is `non-broadcast`.
+    /// Per-interface OSPFv2 settings (area, cost, timers, auth,
+    /// static neighbors). Replaces the previous flat `ospf_*`
+    /// fields. Absent means OSPF is not enabled on this interface.
     #[serde(default)]
-    pub ospf_neighbors: Vec<OspfNeighborConfig>,
-    /// Authentication type: "simple", "message-digest" (RFC 2328 keyed-MD5),
-    /// "hmac-sha-256" / "hmac-sha-384" / "hmac-sha-512" (RFC 5709), or omitted
-    /// for none. MD5 is preserved for legacy interop; new deployments should
-    /// prefer HMAC-SHA-256 or stronger.
-    pub ospf_auth_type: Option<String>,
-    /// Simple-auth cleartext password.
-    pub ospf_auth_key: Option<String>,
-    /// Crypto key ID (1-255) for any keyed crypto auth type.
-    pub ospf_md5_key_id: Option<u8>,
-    /// Crypto key for any keyed crypto auth type (MD5 or HMAC-SHA).
-    pub ospf_md5_key: Option<String>,
-
-    /// ---- OSPFv3 per-interface fields ----
-    pub ospf3_area: Option<serde_yaml::Value>,
-    pub ospf3_cost: Option<u16>,
-    pub ospf3_passive: Option<bool>,
-    pub ospf3_network_type: Option<String>,
-    pub ospf3_hello_interval: Option<u16>,
-    pub ospf3_dead_interval: Option<u32>,
-    pub ospf3_retransmit_interval: Option<u16>,
-    pub ospf3_transmit_delay: Option<u16>,
-    pub ospf3_priority: Option<u8>,
-    pub ospf3_instance_id: Option<u8>,
-    /// Static NBMA neighbor list for OSPFv3. Only honored when
-    /// `ospf6_network_type` is `non-broadcast`. Each entry's address
-    /// must be a link-local IPv6 address (fe80::/10) belonging to
-    /// the peer's interface on this segment — OSPFv3 keys neighbor
-    /// state on link-local addresses, not router-ids.
+    pub ospf: Option<InterfaceOspfConfig>,
+    /// Per-interface OSPFv3 settings. Replaces the previous flat
+    /// `ospf3_*` fields. Absent means OSPFv3 is not enabled on
+    /// this interface.
     #[serde(default)]
-    pub ospf3_neighbors: Vec<Ospf6NeighborConfig>,
+    pub ospf3: Option<InterfaceOspf3Config>,
 
     /// VLAN sub-interfaces sitting under this parent. Each sub
     /// terminates as `<parent>.<vlan_id>` in Linux (lcp-auto-subint
@@ -386,33 +354,14 @@ pub struct SubInterfaceConfig {
     #[serde(default)]
     pub ipv6: Vec<AddrEntry>,
 
-    pub ospf_area: Option<serde_yaml::Value>,
-    pub ospf_cost: Option<u16>,
-    pub ospf_passive: Option<bool>,
-    pub ospf_network_type: Option<String>,
-    pub ospf_hello_interval: Option<u16>,
-    pub ospf_dead_interval: Option<u32>,
-    pub ospf_retransmit_interval: Option<u16>,
-    pub ospf_priority: Option<u8>,
+    /// Per-sub-interface OSPFv2 settings (nested block; replaces
+    /// the previous flat `ospf_*` fields).
     #[serde(default)]
-    pub ospf_neighbors: Vec<OspfNeighborConfig>,
-    pub ospf_auth_type: Option<String>,
-    pub ospf_auth_key: Option<String>,
-    pub ospf_md5_key_id: Option<u8>,
-    pub ospf_md5_key: Option<String>,
-
-    pub ospf3_area: Option<serde_yaml::Value>,
-    pub ospf3_cost: Option<u16>,
-    pub ospf3_passive: Option<bool>,
-    pub ospf3_network_type: Option<String>,
-    pub ospf3_hello_interval: Option<u16>,
-    pub ospf3_dead_interval: Option<u32>,
-    pub ospf3_retransmit_interval: Option<u16>,
-    pub ospf3_transmit_delay: Option<u16>,
-    pub ospf3_priority: Option<u8>,
-    pub ospf3_instance_id: Option<u8>,
+    pub ospf: Option<InterfaceOspfConfig>,
+    /// Per-sub-interface OSPFv3 settings (nested block; replaces
+    /// the previous flat `ospf3_*` fields).
     #[serde(default)]
-    pub ospf3_neighbors: Vec<Ospf6NeighborConfig>,
+    pub ospf3: Option<InterfaceOspf3Config>,
 }
 
 /// Loopback interface (OSPF-relevant fields). Mirrors impd's
@@ -431,14 +380,15 @@ pub struct LoopbackConfig {
     pub ipv4: Vec<AddrEntry>,
     #[serde(default)]
     pub ipv6: Vec<AddrEntry>,
-    pub ospf_area: Option<serde_yaml::Value>,
-    pub ospf_cost: Option<u16>,
-    pub ospf_passive: Option<bool>,
-
-    /// OSPFv3 loopback fields.
-    pub ospf3_area: Option<serde_yaml::Value>,
-    pub ospf3_cost: Option<u16>,
-    pub ospf3_passive: Option<bool>,
+    /// Per-loopback OSPFv2 settings (nested block; replaces the
+    /// previous flat `ospf_*` fields). Loopbacks honor `area`,
+    /// `cost`, and `passive`; other fields (timers, auth) are
+    /// accepted but ignored — loopbacks never form adjacencies.
+    #[serde(default)]
+    pub ospf: Option<InterfaceOspfConfig>,
+    /// Per-loopback OSPFv3 settings.
+    #[serde(default)]
+    pub ospf3: Option<InterfaceOspf3Config>,
 }
 
 /// Parsed, validated OSPF daemon configuration.
@@ -601,6 +551,74 @@ pub struct Ospf6NeighborConfig {
     /// Priority for DR election while the peer hasn't responded.
     #[serde(default)]
     pub priority: Option<u8>,
+}
+
+/// Nested per-interface OSPFv2 configuration block. Matches the
+/// `ospf:` sub-object impd now writes under each interface /
+/// subinterface / loopback in `/persistent/config/router.yaml`
+/// (replacing the previous flat `ospf_*` fields).
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct InterfaceOspfConfig {
+    #[serde(default)]
+    pub area: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub cost: Option<u16>,
+    #[serde(default)]
+    pub passive: Option<bool>,
+    #[serde(default)]
+    pub network_type: Option<String>,
+    #[serde(default)]
+    pub hello_interval: Option<u16>,
+    #[serde(default)]
+    pub dead_interval: Option<u32>,
+    #[serde(default)]
+    pub retransmit_interval: Option<u16>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub auth_type: Option<String>,
+    #[serde(default)]
+    pub auth_key: Option<String>,
+    #[serde(default)]
+    pub md5_key_id: Option<u8>,
+    #[serde(default)]
+    pub md5_key: Option<String>,
+    /// Static NBMA neighbor list. Only honored when `network_type`
+    /// is `non-broadcast`.
+    #[serde(default)]
+    pub neighbors: Vec<OspfNeighborConfig>,
+}
+
+/// Nested per-interface OSPFv3 configuration block. Mirrors
+/// [`InterfaceOspfConfig`] minus the auth fields (OSPFv3 keys auth
+/// in a separate v3-specific block, not modelled here yet) and plus
+/// `transmit_delay` / `instance_id`.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct InterfaceOspf3Config {
+    #[serde(default)]
+    pub area: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub cost: Option<u16>,
+    #[serde(default)]
+    pub passive: Option<bool>,
+    #[serde(default)]
+    pub network_type: Option<String>,
+    #[serde(default)]
+    pub hello_interval: Option<u16>,
+    #[serde(default)]
+    pub dead_interval: Option<u32>,
+    #[serde(default)]
+    pub retransmit_interval: Option<u16>,
+    #[serde(default)]
+    pub transmit_delay: Option<u16>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub instance_id: Option<u8>,
+    /// Static NBMA neighbor list (link-local IPv6 addresses). Only
+    /// honored when `network_type` is `non-broadcast`.
+    #[serde(default)]
+    pub neighbors: Vec<Ospf6NeighborConfig>,
 }
 
 /// A configured OSPF interface.
@@ -865,52 +883,54 @@ impl OspfDaemonConfig {
         for iface in &config.interfaces {
             // Parent-interface OSPF
             if iface_in_vrf(&iface.vrf) {
-                if let Some(area_val) = &iface.ospf_area {
-                    let area_id = parse_area_id_value(area_val)?;
-                    let name = iface.name.as_deref().unwrap_or("").to_string();
+                if let Some(ospf_cfg) = iface.ospf.as_ref() {
+                    if let Some(area_val) = ospf_cfg.area.as_ref() {
+                        let area_id = parse_area_id_value(area_val)?;
+                        let name = iface.name.as_deref().unwrap_or("").to_string();
 
-                    // Use the first IPv4 address on the interface.
-                    let (address, prefix_len) = iface
-                        .ipv4
-                        .first()
-                        .and_then(|a| a.as_pair())
-                        .and_then(|(a, p)| a.parse::<Ipv4Addr>().ok().map(|addr| (addr, p)))
-                        .unwrap_or((Ipv4Addr::UNSPECIFIED, 24));
+                        // Use the first IPv4 address on the interface.
+                        let (address, prefix_len) = iface
+                            .ipv4
+                            .first()
+                            .and_then(|a| a.as_pair())
+                            .and_then(|(a, p)| a.parse::<Ipv4Addr>().ok().map(|addr| (addr, p)))
+                            .unwrap_or((Ipv4Addr::UNSPECIFIED, 24));
 
-                    let passive = iface.ospf_passive.unwrap_or(config.ospf.passive_default);
-                    let auth_key = parse_auth_key(
-                        iface.ospf_auth_type.as_deref(),
-                        iface.ospf_auth_key.as_deref(),
-                        iface.ospf_md5_key_id,
-                        iface.ospf_md5_key.as_deref(),
-                    );
+                        let passive = ospf_cfg.passive.unwrap_or(config.ospf.passive_default);
+                        let auth_key = parse_auth_key(
+                            ospf_cfg.auth_type.as_deref(),
+                            ospf_cfg.auth_key.as_deref(),
+                            ospf_cfg.md5_key_id,
+                            ospf_cfg.md5_key.as_deref(),
+                        );
 
-                    let static_neighbors: Vec<(Ipv4Addr, u8)> = iface
-                        .ospf_neighbors
-                        .iter()
-                        .filter_map(|n| {
-                            let addr: Ipv4Addr = n.address.parse().ok()?;
-                            Some((addr, n.priority.unwrap_or(1)))
-                        })
-                        .collect();
-                    interfaces.push(OspfInterfaceConfig {
-                        name,
-                        address,
-                        prefix_len,
-                        area_id,
-                        cost: iface.ospf_cost.unwrap_or(10),
-                        passive,
-                        network_type: iface
-                            .ospf_network_type
-                            .clone()
-                            .unwrap_or_else(|| "broadcast".to_string()),
-                        hello_interval: iface.ospf_hello_interval.unwrap_or(10),
-                        dead_interval: iface.ospf_dead_interval.unwrap_or(40),
-                        retransmit_interval: iface.ospf_retransmit_interval.unwrap_or(5),
-                        priority: iface.ospf_priority.unwrap_or(1),
-                        auth_key,
-                        static_neighbors,
-                    });
+                        let static_neighbors: Vec<(Ipv4Addr, u8)> = ospf_cfg
+                            .neighbors
+                            .iter()
+                            .filter_map(|n| {
+                                let addr: Ipv4Addr = n.address.parse().ok()?;
+                                Some((addr, n.priority.unwrap_or(1)))
+                            })
+                            .collect();
+                        interfaces.push(OspfInterfaceConfig {
+                            name,
+                            address,
+                            prefix_len,
+                            area_id,
+                            cost: ospf_cfg.cost.unwrap_or(10),
+                            passive,
+                            network_type: ospf_cfg
+                                .network_type
+                                .clone()
+                                .unwrap_or_else(|| "broadcast".to_string()),
+                            hello_interval: ospf_cfg.hello_interval.unwrap_or(10),
+                            dead_interval: ospf_cfg.dead_interval.unwrap_or(40),
+                            retransmit_interval: ospf_cfg.retransmit_interval.unwrap_or(5),
+                            priority: ospf_cfg.priority.unwrap_or(1),
+                            auth_key,
+                            static_neighbors,
+                        });
+                    }
                 }
             }
 
@@ -928,7 +948,10 @@ impl OspfDaemonConfig {
                 if !iface_in_vrf(&sub.vrf) {
                     continue;
                 }
-                let Some(area_val) = &sub.ospf_area else {
+                let Some(ospf_cfg) = sub.ospf.as_ref() else {
+                    continue;
+                };
+                let Some(area_val) = ospf_cfg.area.as_ref() else {
                     continue;
                 };
                 let area_id = parse_area_id_value(area_val)?;
@@ -941,15 +964,15 @@ impl OspfDaemonConfig {
                     .and_then(|(a, p)| a.parse::<Ipv4Addr>().ok().map(|addr| (addr, p)))
                     .unwrap_or((Ipv4Addr::UNSPECIFIED, 24));
 
-                let passive = sub.ospf_passive.unwrap_or(config.ospf.passive_default);
+                let passive = ospf_cfg.passive.unwrap_or(config.ospf.passive_default);
                 let auth_key = parse_auth_key(
-                    sub.ospf_auth_type.as_deref(),
-                    sub.ospf_auth_key.as_deref(),
-                    sub.ospf_md5_key_id,
-                    sub.ospf_md5_key.as_deref(),
+                    ospf_cfg.auth_type.as_deref(),
+                    ospf_cfg.auth_key.as_deref(),
+                    ospf_cfg.md5_key_id,
+                    ospf_cfg.md5_key.as_deref(),
                 );
-                let static_neighbors: Vec<(Ipv4Addr, u8)> = sub
-                    .ospf_neighbors
+                let static_neighbors: Vec<(Ipv4Addr, u8)> = ospf_cfg
+                    .neighbors
                     .iter()
                     .filter_map(|n| {
                         let addr: Ipv4Addr = n.address.parse().ok()?;
@@ -961,16 +984,16 @@ impl OspfDaemonConfig {
                     address,
                     prefix_len,
                     area_id,
-                    cost: sub.ospf_cost.unwrap_or(10),
+                    cost: ospf_cfg.cost.unwrap_or(10),
                     passive,
-                    network_type: sub
-                        .ospf_network_type
+                    network_type: ospf_cfg
+                        .network_type
                         .clone()
                         .unwrap_or_else(|| "broadcast".to_string()),
-                    hello_interval: sub.ospf_hello_interval.unwrap_or(10),
-                    dead_interval: sub.ospf_dead_interval.unwrap_or(40),
-                    retransmit_interval: sub.ospf_retransmit_interval.unwrap_or(5),
-                    priority: sub.ospf_priority.unwrap_or(1),
+                    hello_interval: ospf_cfg.hello_interval.unwrap_or(10),
+                    dead_interval: ospf_cfg.dead_interval.unwrap_or(40),
+                    retransmit_interval: ospf_cfg.retransmit_interval.unwrap_or(5),
+                    priority: ospf_cfg.priority.unwrap_or(1),
                     auth_key,
                     static_neighbors,
                 });
@@ -982,7 +1005,10 @@ impl OspfDaemonConfig {
             if !iface_in_vrf(&lb.vrf) {
                 continue;
             }
-            if let Some(area_val) = &lb.ospf_area {
+            let Some(ospf_cfg) = lb.ospf.as_ref() else {
+                continue;
+            };
+            if let Some(area_val) = ospf_cfg.area.as_ref() {
                 let area_id = parse_area_id_value(area_val)?;
                 let name = lb.name.as_deref().unwrap_or("").to_string();
 
@@ -998,8 +1024,8 @@ impl OspfDaemonConfig {
                     address,
                     prefix_len,
                     area_id,
-                    cost: lb.ospf_cost.unwrap_or(1),
-                    passive: lb.ospf_passive.unwrap_or(true),
+                    cost: ospf_cfg.cost.unwrap_or(1),
+                    passive: ospf_cfg.passive.unwrap_or(true),
                     network_type: "point-to-point".to_string(),
                     hello_interval: 10,
                     dead_interval: 40,
@@ -1215,52 +1241,54 @@ impl Ospf6DaemonConfig {
         for iface in &config.interfaces {
             // Parent-interface OSPFv3
             if iface_in_vrf(&iface.vrf) {
-                if let Some(area_val) = &iface.ospf3_area {
-                    let area_id = parse_area_id_value(area_val)?;
-                    let name = iface.name.as_deref().unwrap_or("").to_string();
-                    let passive = iface.ospf3_passive.unwrap_or(config.ospf3.passive_default);
-                    // Parse the static NBMA neighbor list (link-local IPv6
-                    // addresses) — only meaningful for non-broadcast network
-                    // type, but we always parse so misconfigurations show up
-                    // as warnings rather than silent drops.
-                    let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
-                    for n in &iface.ospf3_neighbors {
-                        match n.address.parse::<Ipv6Addr>() {
-                            Ok(addr) => {
-                                if !addr.is_unicast_link_local() {
+                if let Some(ospf3_cfg) = iface.ospf3.as_ref() {
+                    if let Some(area_val) = ospf3_cfg.area.as_ref() {
+                        let area_id = parse_area_id_value(area_val)?;
+                        let name = iface.name.as_deref().unwrap_or("").to_string();
+                        let passive = ospf3_cfg.passive.unwrap_or(config.ospf3.passive_default);
+                        // Parse the static NBMA neighbor list (link-local IPv6
+                        // addresses) — only meaningful for non-broadcast network
+                        // type, but we always parse so misconfigurations show up
+                        // as warnings rather than silent drops.
+                        let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
+                        for n in &ospf3_cfg.neighbors {
+                            match n.address.parse::<Ipv6Addr>() {
+                                Ok(addr) => {
+                                    if !addr.is_unicast_link_local() {
+                                        tracing::warn!(
+                                            addr = %addr,
+                                            "ospf6 static neighbor is not link-local; OSPFv3 expects fe80::/10"
+                                        );
+                                    }
+                                    v6_static_neighbors.push((addr, n.priority.unwrap_or(1)));
+                                }
+                                Err(e) => {
                                     tracing::warn!(
-                                        addr = %addr,
-                                        "ospf6 static neighbor is not link-local; OSPFv3 expects fe80::/10"
+                                        addr = %n.address,
+                                        error = %e,
+                                        "ignoring invalid ospf6 static neighbor address"
                                     );
                                 }
-                                v6_static_neighbors.push((addr, n.priority.unwrap_or(1)));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    addr = %n.address,
-                                    error = %e,
-                                    "ignoring invalid ospf6 static neighbor address"
-                                );
                             }
                         }
+                        interfaces.push(Ospf6InterfaceConfig {
+                            name,
+                            area_id,
+                            cost: ospf3_cfg.cost.unwrap_or(10),
+                            passive,
+                            network_type: ospf3_cfg
+                                .network_type
+                                .clone()
+                                .unwrap_or_else(|| "broadcast".to_string()),
+                            hello_interval: ospf3_cfg.hello_interval.unwrap_or(10),
+                            dead_interval: ospf3_cfg.dead_interval.unwrap_or(40),
+                            retransmit_interval: ospf3_cfg.retransmit_interval.unwrap_or(5),
+                            transmit_delay: ospf3_cfg.transmit_delay.unwrap_or(1),
+                            priority: ospf3_cfg.priority.unwrap_or(1),
+                            instance_id: ospf3_cfg.instance_id.unwrap_or(0),
+                            static_neighbors: v6_static_neighbors,
+                        });
                     }
-                    interfaces.push(Ospf6InterfaceConfig {
-                        name,
-                        area_id,
-                        cost: iface.ospf3_cost.unwrap_or(10),
-                        passive,
-                        network_type: iface
-                            .ospf3_network_type
-                            .clone()
-                            .unwrap_or_else(|| "broadcast".to_string()),
-                        hello_interval: iface.ospf3_hello_interval.unwrap_or(10),
-                        dead_interval: iface.ospf3_dead_interval.unwrap_or(40),
-                        retransmit_interval: iface.ospf3_retransmit_interval.unwrap_or(5),
-                        transmit_delay: iface.ospf3_transmit_delay.unwrap_or(1),
-                        priority: iface.ospf3_priority.unwrap_or(1),
-                        instance_id: iface.ospf3_instance_id.unwrap_or(0),
-                        static_neighbors: v6_static_neighbors,
-                    });
                 }
             }
 
@@ -1274,14 +1302,17 @@ impl Ospf6DaemonConfig {
                 if !iface_in_vrf(&sub.vrf) {
                     continue;
                 }
-                let Some(area_val) = &sub.ospf3_area else {
+                let Some(ospf3_cfg) = sub.ospf3.as_ref() else {
+                    continue;
+                };
+                let Some(area_val) = ospf3_cfg.area.as_ref() else {
                     continue;
                 };
                 let area_id = parse_area_id_value(area_val)?;
                 let name = format!("{parent_name}.{}", sub.vlan_id);
-                let passive = sub.ospf3_passive.unwrap_or(config.ospf3.passive_default);
+                let passive = ospf3_cfg.passive.unwrap_or(config.ospf3.passive_default);
                 let mut v6_static_neighbors: Vec<(Ipv6Addr, u8)> = Vec::new();
-                for n in &sub.ospf3_neighbors {
+                for n in &ospf3_cfg.neighbors {
                     match n.address.parse::<Ipv6Addr>() {
                         Ok(addr) => {
                             if !addr.is_unicast_link_local() {
@@ -1304,18 +1335,18 @@ impl Ospf6DaemonConfig {
                 interfaces.push(Ospf6InterfaceConfig {
                     name,
                     area_id,
-                    cost: sub.ospf3_cost.unwrap_or(10),
+                    cost: ospf3_cfg.cost.unwrap_or(10),
                     passive,
-                    network_type: sub
-                        .ospf3_network_type
+                    network_type: ospf3_cfg
+                        .network_type
                         .clone()
                         .unwrap_or_else(|| "broadcast".to_string()),
-                    hello_interval: sub.ospf3_hello_interval.unwrap_or(10),
-                    dead_interval: sub.ospf3_dead_interval.unwrap_or(40),
-                    retransmit_interval: sub.ospf3_retransmit_interval.unwrap_or(5),
-                    transmit_delay: sub.ospf3_transmit_delay.unwrap_or(1),
-                    priority: sub.ospf3_priority.unwrap_or(1),
-                    instance_id: sub.ospf3_instance_id.unwrap_or(0),
+                    hello_interval: ospf3_cfg.hello_interval.unwrap_or(10),
+                    dead_interval: ospf3_cfg.dead_interval.unwrap_or(40),
+                    retransmit_interval: ospf3_cfg.retransmit_interval.unwrap_or(5),
+                    transmit_delay: ospf3_cfg.transmit_delay.unwrap_or(1),
+                    priority: ospf3_cfg.priority.unwrap_or(1),
+                    instance_id: ospf3_cfg.instance_id.unwrap_or(0),
                     static_neighbors: v6_static_neighbors,
                 });
             }
@@ -1327,7 +1358,10 @@ impl Ospf6DaemonConfig {
             if !iface_in_vrf(&lb.vrf) {
                 continue;
             }
-            let Some(area_val) = &lb.ospf3_area else {
+            let Some(ospf3_cfg) = lb.ospf3.as_ref() else {
+                continue;
+            };
+            let Some(area_val) = ospf3_cfg.area.as_ref() else {
                 continue;
             };
             let area_id = parse_area_id_value(area_val)?;
@@ -1335,8 +1369,8 @@ impl Ospf6DaemonConfig {
             interfaces.push(Ospf6InterfaceConfig {
                 name,
                 area_id,
-                cost: lb.ospf3_cost.unwrap_or(1),
-                passive: lb.ospf3_passive.unwrap_or(true),
+                cost: ospf3_cfg.cost.unwrap_or(1),
+                passive: ospf3_cfg.passive.unwrap_or(true),
                 network_type: "point-to-point".to_string(),
                 hello_interval: 10,
                 dead_interval: 40,
@@ -1505,9 +1539,9 @@ mod tests {
 
     fn yaml_with_subinterface_ospf(extra: &str) -> RouterConfig {
         // Minimal router.yaml shape with a single VLAN sub-interface
-        // carrying ospf_area. No top-level ospf.areas — exercising
-        // the path that would have been silently swallowed before
-        // the parent-vrf-gating fix.
+        // carrying nested ospf/ospf3 blocks. No top-level ospf.areas
+        // — exercising the path that would have been silently
+        // swallowed before the parent-vrf-gating fix.
         let body = format!(
             r#"
 ospf:
@@ -1527,8 +1561,10 @@ interfaces:
         ipv6:
           - "2001:db8:37::5/64"
         create_lcp: true
-        ospf_area: 0
-        ospf3_area: 0
+        ospf:
+          area: 0
+        ospf3:
+          area: 0
         {extra}
 "#
         );
@@ -1537,7 +1573,7 @@ interfaces:
 
     #[test]
     fn subinterface_ospf_v2_lands_with_dotted_name() {
-        // Regression: an `ospf_area: 0` on a sub-interface must
+        // Regression: an `ospf: { area: 0 }` on a sub-interface must
         // produce an OspfInterfaceConfig keyed on `<parent>.<vlan_id>`
         // with the sub's own IPv4 (not the parent's, and not
         // UNSPECIFIED) — pre-fix, the sub-interface scan didn't
@@ -1583,7 +1619,8 @@ loopbacks:
     ipv4:
       - "10.255.255.100/32"
     create_lcp: true
-    ospf_area: 0
+    ospf:
+      area: 0
 "#;
         let cfg: RouterConfig = serde_yaml::from_str(yaml).expect("parse loopback yaml");
         let parsed = OspfDaemonConfig::from_router_yaml(cfg, None).unwrap();
@@ -1632,7 +1669,8 @@ interfaces:
         ipv4:
           - "192.168.37.5/24"
         create_lcp: true
-        ospf_area: 0
+        ospf:
+          area: 0
         vrf: customer_vrf
 "#;
         let cfg: RouterConfig = serde_yaml::from_str(yaml).unwrap();
