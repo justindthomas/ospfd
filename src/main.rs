@@ -74,7 +74,13 @@ enum IoBackend {
 }
 
 struct QueryArgs {
-    control_socket: String,
+    /// `None` means "fan out across every `/run/ospfd*.sock` the
+    /// daemon owns" — the default behaviour when the operator
+    /// doesn't pass `--control-socket`. A single ospfd process
+    /// can serve several VRFs (each on its own control socket);
+    /// without fan-out the query CLI would only ever show the
+    /// default-VRF instance, hiding any per-VRF state.
+    control_socket: Option<String>,
     request: ControlRequest,
     output: OutputFormat,
 }
@@ -91,14 +97,18 @@ fn print_usage_and_exit(code: i32) -> ! {
     eprintln!("  ospfd query <status|neighbors|interfaces|database|routes> [options]");
     eprintln!();
     eprintln!("Query options:");
-    eprintln!("  -o, --output <text|json>  output format (default: text)");
-    eprintln!("  --area <ID>               filter by area ID (e.g., 0.0.0.0)");
-    eprintln!("  --type <TYPE>             filter by LSA type");
-    eprintln!("                              (router/network/summary/external)");
+    eprintln!("  -o, --output <text|json>   output format (default: text)");
+    eprintln!("  --area <ID>                filter by area ID (e.g., 0.0.0.0)");
+    eprintln!("  --type <TYPE>              filter by LSA type");
+    eprintln!("                               (router/network/summary/external)");
+    eprintln!("  --control-socket <PATH>    target a single VRF's control socket");
+    eprintln!("                               (default: fan out across every");
+    eprintln!("                               /run/ospfd*.sock the daemon owns)");
     eprintln!();
-    eprintln!("  --vrf <NAME>              DEPRECATED — ignored. A single ospfd");
-    eprintln!("                            process now owns every VRF declared");
-    eprintln!("                            in the config.");
+    eprintln!("  --vrf <NAME>               DEPRECATED — ignored. A single ospfd");
+    eprintln!("                             process now owns every VRF declared");
+    eprintln!("                             in the config; query output is");
+    eprintln!("                             auto-sectioned per VRF.");
     std::process::exit(code);
 }
 
@@ -171,7 +181,7 @@ fn parse_args() -> Command {
 }
 
 fn parse_query_args<I: Iterator<Item = String>>(mut args: I) -> QueryArgs {
-    let mut control_socket = DEFAULT_CONTROL_SOCKET.to_string();
+    let mut control_socket: Option<String> = None;
     let subject = args.next().unwrap_or_else(|| {
         eprintln!("query requires a subject (status, neighbors, ...)");
         print_usage_and_exit(1);
@@ -184,7 +194,7 @@ fn parse_query_args<I: Iterator<Item = String>>(mut args: I) -> QueryArgs {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--control-socket" => {
-                control_socket = args.next().expect("--control-socket requires a path");
+                control_socket = Some(args.next().expect("--control-socket requires a path"));
             }
             "--area" => {
                 area = Some(args.next().expect("--area requires a value"));
@@ -536,17 +546,132 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Run a one-shot query against a live daemon.
+/// Run a one-shot query against a live daemon. When the operator
+/// passed `--control-socket <path>` explicitly we hit just that
+/// one socket; otherwise we enumerate every `/run/ospfd*.sock`
+/// the daemon advertises (one per VRF) and query each, printing
+/// the result sectioned by VRF name. JSON output wraps the
+/// per-VRF replies in an outer array so downstream tooling can
+/// still parse a single response stream.
 async fn run_query(args: QueryArgs) -> anyhow::Result<()> {
     // No tracing subscriber for query mode — plain output only.
-    let response = control::client_request(&args.control_socket, &args.request)
-        .await
-        .map_err(|e| anyhow::anyhow!("control request failed: {}", e))?;
+    let targets: Vec<(Option<String>, String)> = match args.control_socket {
+        Some(path) => vec![(vrf_name_from_socket(&path), path)],
+        None => discover_control_sockets(),
+    };
+
+    if targets.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no ospfd control sockets found under /run/ospfd*.sock — \
+             is imp-ospfd running?"
+        ));
+    }
+
+    let mut replies: Vec<(Option<String>, ControlResponse)> = Vec::with_capacity(targets.len());
+    for (vrf, path) in targets {
+        match control::client_request(&path, &args.request).await {
+            Ok(resp) => replies.push((vrf, resp)),
+            Err(e) => replies.push((
+                vrf,
+                ControlResponse::Error {
+                    error: format!("control request to {path} failed: {e}"),
+                },
+            )),
+        }
+    }
+
     match args.output {
-        OutputFormat::Text => print_response(&response),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&response)?),
+        OutputFormat::Text => {
+            let multi = replies.len() > 1;
+            for (i, (vrf, resp)) in replies.iter().enumerate() {
+                if multi {
+                    if i > 0 {
+                        println!();
+                    }
+                    let label = vrf.as_deref().unwrap_or("(default)");
+                    println!("=== VRF {label} ===");
+                }
+                print_response(resp);
+            }
+        }
+        OutputFormat::Json => {
+            // Always emit an array; single-instance callers get a
+            // 1-element array, which is consistent and machine-
+            // parseable. Per-entry shape: {"vrf": "...", "reply": {...}}.
+            #[derive(serde::Serialize)]
+            struct Entry<'a> {
+                vrf: Option<&'a String>,
+                reply: &'a ControlResponse,
+            }
+            let entries: Vec<Entry> = replies
+                .iter()
+                .map(|(vrf, reply)| Entry {
+                    vrf: vrf.as_ref(),
+                    reply,
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
     }
     Ok(())
+}
+
+/// Enumerate `/run/ospfd*.sock` and return `(vrf, path)` pairs,
+/// ordered with the default-VRF socket first followed by named
+/// VRFs in lexicographic order. Ignores `.lock` files and any
+/// path that doesn't match the daemon's own naming convention
+/// (see `control_socket_path`).
+fn discover_control_sockets() -> Vec<(Option<String>, String)> {
+    let dir = match std::fs::read_dir("/run") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(Option<String>, String)> = Vec::new();
+    for entry in dir.flatten() {
+        let os_name = entry.file_name();
+        let name = match os_name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        // Must end in `.sock` (exclude `.sock.lock`) and start
+        // with `ospfd` (either the bare default or the
+        // `ospfd@<vrf>.sock` form).
+        if !name.ends_with(".sock") {
+            continue;
+        }
+        let vrf = if name == "ospfd.sock" {
+            None
+        } else if let Some(rest) = name
+            .strip_prefix("ospfd@")
+            .and_then(|s| s.strip_suffix(".sock"))
+        {
+            Some(rest.to_string())
+        } else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().into_owned();
+        out.push((vrf, path));
+    }
+    out.sort_by(|a, b| match (&a.0, &b.0) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Less,
+        (_, None) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => a.cmp(b),
+    });
+    out
+}
+
+/// Reverse of `control_socket_path`: given a socket path, derive
+/// the VRF name (or `None` for the default-VRF socket). Used when
+/// the operator pinned a specific socket with `--control-socket`
+/// and we want the right `=== VRF <name> ===` header.
+fn vrf_name_from_socket(path: &str) -> Option<String> {
+    let stem = std::path::Path::new(path).file_name()?.to_str()?;
+    if stem == "ospfd.sock" {
+        None
+    } else {
+        stem.strip_prefix("ospfd@")?.strip_suffix(".sock").map(String::from)
+    }
 }
 
 fn print_response(resp: &ControlResponse) {
