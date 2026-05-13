@@ -121,6 +121,13 @@ pub struct Neighbor {
     pub last_heard: Instant,
     /// When we last sent a DD packet to this neighbor (for retransmit pacing).
     pub last_dd_sent: Instant,
+    /// When we last sent a Link State Request packet to this neighbor.
+    /// RFC 2328 §10.9: LSRs are retransmitted every RxmtInterval while
+    /// the neighbor is in Loading state (or in Exchange with a non-empty
+    /// request list) until the list drains or the neighbor leaves Loading.
+    /// Without this, if the peer's LSU response is dropped or incomplete,
+    /// the adjacency wedges in Loading forever.
+    pub last_lsr_sent: Instant,
 }
 
 impl Neighbor {
@@ -142,6 +149,11 @@ impl Neighbor {
             db_summary_list: Vec::new(),
             last_heard: Instant::now(),
             last_dd_sent: Instant::now() - Duration::from_secs(10),
+            // Seed in the past so the first LSR can fire immediately
+            // — once we add a request to ls_request_list and enter
+            // Exchange/Loading, the next timer tick should emit it
+            // without waiting a full RxmtInterval.
+            last_lsr_sent: Instant::now() - Duration::from_secs(60),
         }
     }
 

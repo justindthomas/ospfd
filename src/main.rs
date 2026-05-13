@@ -1076,6 +1076,14 @@ async fn run_v2_instance(
 
                 let pending_dds = inst.emit_pending_dds();
                 send_responses(&io, &mut inst, pending_dds);
+
+                // Retransmit LSRs for any Exchange/Loading neighbor
+                // whose request list is still non-empty after
+                // RxmtInterval. Per RFC 2328 §10.9 — without this,
+                // a dropped LSU response wedges the adjacency in
+                // Loading until the peer's dead-timer fires.
+                let pending_lsrs = inst.emit_pending_lsrs();
+                send_responses(&io, &mut inst, pending_lsrs);
             }
 
             _ = neighbor_check.tick() => {

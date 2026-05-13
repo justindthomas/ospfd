@@ -577,35 +577,134 @@ impl OspfInstance {
         }
         let router_id = self.router_id;
         if needs_lsr {
-            let iface = &self.interfaces[iface_idx];
-            let requests: Vec<crate::packet::lsr::LsRequest> = iface
-                .neighbors
-                .get(&header.router_id)
-                .map(|n| {
-                    n.ls_request_list
-                        .iter()
-                        .take(20) // cap per packet
-                        .map(|key| crate::packet::lsr::LsRequest {
-                            ls_type: key.ls_type,
-                            link_state_id: key.link_state_id,
-                            advertising_router: key.advertising_router,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let iface = &mut self.interfaces[iface_idx];
+            let (requests, area_id, sw_if_index) = {
+                let n = match iface.neighbors.get_mut(&header.router_id) {
+                    Some(n) => n,
+                    None => return,
+                };
+                let reqs: Vec<crate::packet::lsr::LsRequest> = n
+                    .ls_request_list
+                    .iter()
+                    .take(20) // cap per packet
+                    .map(|key| crate::packet::lsr::LsRequest {
+                        ls_type: key.ls_type,
+                        link_state_id: key.link_state_id,
+                        advertising_router: key.advertising_router,
+                    })
+                    .collect();
+                if !reqs.is_empty() {
+                    n.last_lsr_sent = Instant::now();
+                }
+                (reqs, iface.area_id, iface.sw_if_index)
+            };
 
             if !requests.is_empty() {
                 let lsr_pkt = OspfPacket::LinkStateRequest(
                     OspfHeader::new(
                         OspfPacketType::LinkStateRequest,
                         router_id,
-                        iface.area_id,
+                        area_id,
                     ),
                     crate::packet::lsr::LsRequestPacket { requests },
                 );
-                responses.push((iface.sw_if_index, src_addr, lsr_pkt));
+                responses.push((sw_if_index, src_addr, lsr_pkt));
             }
         }
+    }
+
+    /// Retransmit Link State Requests for any neighbor in Exchange or
+    /// Loading state that has a non-empty `ls_request_list` and hasn't
+    /// been sent an LSR in the last `RxmtInterval`. RFC 2328 §10.9
+    /// requires retransmission until the request list drains or the
+    /// neighbor leaves Loading; without it, a single dropped or
+    /// truncated LSU response from the peer wedges the adjacency in
+    /// Loading until the dead-timer fires (or impd is restarted).
+    ///
+    /// Called from the same `hello_tick` branch in the daemon loop
+    /// that drives `emit_pending_dds`, so the retransmit cadence is
+    /// bounded by the 1-second tick AND each interface's
+    /// `rxmt_interval` (5s by default).
+    pub fn emit_pending_lsrs(&mut self) -> Vec<(u32, Ipv4Addr, OspfPacket)> {
+        let mut responses = Vec::new();
+        let now = Instant::now();
+        let router_id = self.router_id;
+
+        // Snapshot which (iface_idx, neighbor_id) pairs are due for
+        // an LSR retransmit, holding only the immutable borrow we
+        // need to read state.
+        struct Due {
+            iface_idx: usize,
+            neighbor_id: Ipv4Addr,
+            address: Ipv4Addr,
+            area_id: Ipv4Addr,
+            sw_if_index: u32,
+        }
+        let due: Vec<Due> = self
+            .interfaces
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, iface)| {
+                let rxmt = Duration::from_secs(iface.rxmt_interval.max(1) as u64);
+                let area_id = iface.area_id;
+                let sw_if_index = iface.sw_if_index;
+                iface
+                    .neighbors
+                    .values()
+                    .filter(move |n| {
+                        matches!(n.state, NeighborState::Exchange | NeighborState::Loading)
+                            && !n.ls_request_list.is_empty()
+                            && now.saturating_duration_since(n.last_lsr_sent) >= rxmt
+                    })
+                    .map(move |n| Due {
+                        iface_idx: idx,
+                        neighbor_id: n.router_id,
+                        address: n.address,
+                        area_id,
+                        sw_if_index,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for d in due {
+            // Build the LSR with the current request list, stamping
+            // last_lsr_sent so we don't double-fire on the next tick.
+            let iface = match self.interfaces.get_mut(d.iface_idx) {
+                Some(i) => i,
+                None => continue,
+            };
+            let n = match iface.neighbors.get_mut(&d.neighbor_id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let requests: Vec<crate::packet::lsr::LsRequest> = n
+                .ls_request_list
+                .iter()
+                .take(20)
+                .map(|key| crate::packet::lsr::LsRequest {
+                    ls_type: key.ls_type,
+                    link_state_id: key.link_state_id,
+                    advertising_router: key.advertising_router,
+                })
+                .collect();
+            if requests.is_empty() {
+                continue;
+            }
+            n.last_lsr_sent = now;
+            tracing::debug!(
+                neighbor = %d.neighbor_id,
+                count = requests.len(),
+                "retransmitting LSR (request list non-empty)",
+            );
+            let lsr_pkt = OspfPacket::LinkStateRequest(
+                OspfHeader::new(OspfPacketType::LinkStateRequest, router_id, d.area_id),
+                crate::packet::lsr::LsRequestPacket { requests },
+            );
+            responses.push((d.sw_if_index, d.address, lsr_pkt));
+        }
+
+        responses
     }
 
     /// Process a Link State Update packet (RFC 2328 Section 13).
