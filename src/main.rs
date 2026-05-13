@@ -467,6 +467,54 @@ fn resolve_kernel_ifindex(name: &str, total_ms: u64) -> anyhow::Result<u32> {
 /// live in someone else's VRF, otherwise the per-VRF FIB ends
 /// up flooded with foreign prefixes. VPP exposes the per-iface
 /// table via `sw_interface_get_table(sw_if_index, is_ipv6=false)`.
+/// Re-walk VPP for connected addresses and originate / refresh
+/// the AS-external (Type 5) LSAs for any prefix the
+/// redistribute-connected policy matches. Called from two
+/// places:
+///
+///   * Periodic LSRefreshTime check — keeps existing LSAs from
+///     ageing to MaxAge.
+///   * After SIGHUP — picks up addresses impd just added to
+///     VPP that aren't visible in router.yaml. Without this,
+///     a newly-added connected prefix sits in VPP / kernel FIB
+///     and never propagates via OSPF until the next refresh
+///     cycle (~30 min).
+///
+/// `reason` is a short tag for the log line so operators can
+/// tell why the LSAs got re-originated.
+async fn refresh_external_lsas(
+    instance: &Arc<Mutex<OspfInstance>>,
+    vpp: &Arc<vpp_api::VppClient>,
+    io: &InstanceIo,
+    config: &OspfDaemonConfig,
+    reason: &str,
+) {
+    let enrolled: std::collections::HashSet<u32> = {
+        let inst = instance.lock().await;
+        inst.interfaces
+            .iter()
+            .map(|i| i.sw_if_index)
+            .filter(|s| *s != 0)
+            .collect()
+    };
+    let externals = discover_externals_v4(vpp, &enrolled, config.table_id_v4).await;
+    let summaries = config.summary_addresses.clone();
+    let mut inst = instance.lock().await;
+    let ext_lsas = inst.originate_external_lsas(&config.redistribute, &externals, &summaries);
+    if !ext_lsas.is_empty() {
+        tracing::info!(
+            vrf = ?config.vrf_name,
+            count = ext_lsas.len(),
+            reason,
+            "originated AS-external LSAs",
+        );
+        let router_id = inst.router_id;
+        let mut responses = Vec::new();
+        inst.flood_lsas_to_others(usize::MAX, router_id, &ext_lsas, &mut responses);
+        send_responses(io, &mut inst, responses);
+    }
+}
+
 async fn discover_externals_v4(
     vpp: &vpp_api::VppClient,
     enrolled: &std::collections::HashSet<u32>,
@@ -1120,42 +1168,14 @@ async fn run_v2_instance(
                 // peer's LSDB — silently dropping every redistributed
                 // prefix from downstream routing tables once an hour.
                 if refresh_ext {
-                    // Re-snapshot the enrolled interface set; sub-iface
-                    // adds/removes since the last tick should be
-                    // visible to the externals discovery walk.
-                    let enrolled: std::collections::HashSet<u32> = {
-                        let inst = instance.lock().await;
-                        inst.interfaces
-                            .iter()
-                            .map(|i| i.sw_if_index)
-                            .filter(|s| *s != 0)
-                            .collect()
-                    };
-                    let externals =
-                        discover_externals_v4(&vpp, &enrolled, config.table_id_v4).await;
-                    let summaries = config.summary_addresses.clone();
-                    let mut inst = instance.lock().await;
-                    let ext_lsas = inst.originate_external_lsas(
-                        &config.redistribute,
-                        &externals,
-                        &summaries,
-                    );
-                    if !ext_lsas.is_empty() {
-                        tracing::info!(
-                            vrf = ?config.vrf_name,
-                            count = ext_lsas.len(),
-                            "refreshed self-originated AS-external LSAs",
-                        );
-                        let router_id = inst.router_id;
-                        let mut responses = Vec::new();
-                        inst.flood_lsas_to_others(
-                            usize::MAX,
-                            router_id,
-                            &ext_lsas,
-                            &mut responses,
-                        );
-                        send_responses(&io, &mut inst, responses);
-                    }
+                    refresh_external_lsas(
+                        &instance,
+                        &vpp,
+                        &io,
+                        &config,
+                        "periodic refresh",
+                    )
+                    .await;
                 }
             }
 
@@ -1300,6 +1320,27 @@ async fn run_v2_instance(
                                 "reload: no effective changes",
                             );
                         }
+                        drop(inst);
+
+                        // Walk VPP externals after reload — impd's
+                        // apply path adds/removes interface
+                        // addresses BEFORE SIGHUPing us, and those
+                        // changes don't show up in router.yaml
+                        // (they live in VPP). Without this, a newly
+                        // added connected prefix sits in VPP and
+                        // the kernel FIB but doesn't propagate via
+                        // OSPF until the next LSRefreshTime cycle
+                        // (~30 min). With this, the next SIGHUP
+                        // after `imp commit` floods the LSA
+                        // immediately.
+                        refresh_external_lsas(
+                            &instance,
+                            &vpp,
+                            &io,
+                            &config,
+                            "post-SIGHUP refresh",
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
