@@ -51,6 +51,11 @@ pub struct RouterConfig {
     pub interfaces: Vec<InterfaceConfig>,
     #[serde(default)]
     pub loopbacks: Vec<LoopbackConfig>,
+    /// GRE/IPIP tunnels. ospfd runs OSPF over a tunnel when its
+    /// `ospf:` block is present; the VPP interface is `gre{idx}`
+    /// (positional — matches ecrd's render and the boot template).
+    #[serde(default)]
+    pub tunnels: Vec<TunnelConfig>,
     /// Top-level route-maps shared across daemons (bgpd, ospfd,
     /// future producers). Each map is referenced by name from
     /// per-protocol redistribute entries. Universal-clause-only
@@ -387,6 +392,26 @@ pub struct LoopbackConfig {
     #[serde(default)]
     pub ospf: Option<InterfaceOspfConfig>,
     /// Per-loopback OSPFv3 settings.
+    #[serde(default)]
+    pub ospf3: Option<InterfaceOspf3Config>,
+}
+
+/// On-disk GRE/IPIP tunnel. ospfd only needs the tunnel's own L3
+/// address and its `ospf:` block; the underlay (local_ip/remote_ip,
+/// create_lcp, mtu) is ecrd's concern and is tolerated/ignored here.
+/// The VPP interface name is `gre{idx}` by list position.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TunnelConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub vrf: Option<String>,
+    /// The tunnel's L3 address(es). `tunnel_ip` in the YAML, with a
+    /// `tunnel_ipv4` alias for older configs.
+    #[serde(default, alias = "tunnel_ipv4")]
+    pub tunnel_ip: Vec<AddrEntry>,
+    #[serde(default)]
+    pub ospf: Option<InterfaceOspfConfig>,
     #[serde(default)]
     pub ospf3: Option<InterfaceOspf3Config>,
 }
@@ -1036,6 +1061,56 @@ impl OspfDaemonConfig {
                     static_neighbors: Vec::new(),
                 });
             }
+        }
+
+        // GRE/IPIP tunnels. A tunnel is point-to-point by nature, so it
+        // forms a real adjacency (not passive) — unlike loopbacks. VPP
+        // names tunnels `gre{idx}` by list position; ospfd discovers the
+        // address from VPP but we also carry the configured one through.
+        for (idx, tun) in config.tunnels.iter().enumerate() {
+            if !iface_in_vrf(&tun.vrf) {
+                continue;
+            }
+            let Some(ospf_cfg) = tun.ospf.as_ref() else {
+                continue;
+            };
+            let Some(area_val) = ospf_cfg.area.as_ref() else {
+                continue;
+            };
+            let area_id = parse_area_id_value(area_val)?;
+            let name = format!("gre{idx}");
+            let (address, prefix_len) = tun
+                .tunnel_ip
+                .iter()
+                .find_map(|a| a.as_pair())
+                .and_then(|(a, p)| a.parse::<Ipv4Addr>().ok().map(|addr| (addr, p)))
+                .unwrap_or((Ipv4Addr::UNSPECIFIED, 30));
+            let auth_key = parse_auth_key(
+                ospf_cfg.auth_type.as_deref(),
+                ospf_cfg.auth_key.as_deref(),
+                ospf_cfg.md5_key_id,
+                ospf_cfg.md5_key.as_deref(),
+            );
+            interfaces.push(OspfInterfaceConfig {
+                name,
+                address,
+                prefix_len,
+                area_id,
+                cost: ospf_cfg.cost.unwrap_or(10),
+                passive: ospf_cfg.passive.unwrap_or(false),
+                // GRE is inherently point-to-point; honour an explicit
+                // override but default correctly so it matches the peer.
+                network_type: ospf_cfg
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| "point-to-point".to_string()),
+                hello_interval: ospf_cfg.hello_interval.unwrap_or(10),
+                dead_interval: ospf_cfg.dead_interval.unwrap_or(40),
+                retransmit_interval: ospf_cfg.retransmit_interval.unwrap_or(5),
+                priority: ospf_cfg.priority.unwrap_or(0),
+                auth_key,
+                static_neighbors: Vec::new(),
+            });
         }
 
         // Compile the top-level route_maps block once so both v4
