@@ -1692,13 +1692,35 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // One shared interface dump for every instance to read against.
-    let vpp_interfaces = vpp
+    // One shared interface dump for every instance to read against. Retry
+    // while empty: ospfd is (re)spawned the moment VPP binds its API socket —
+    // which can pre-date commands-core.txt creating the interfaces — and an
+    // ecrd SIGHUP reload re-runs this setup while its apply pass is mid-churn
+    // on VPP. An empty dump makes build_v2_setup skip every interface (no
+    // adjacencies form, suite-wide), so poll briefly for a populated result.
+    let mut vpp_interfaces = vpp
         .dump::<
             vpp_api::generated::interface::SwInterfaceDump,
             vpp_api::generated::interface::SwInterfaceDetails,
         >(vpp_api::generated::interface::SwInterfaceDump::default())
         .await?;
+    if vpp_interfaces.is_empty() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while vpp_interfaces.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            vpp_interfaces = vpp
+                .dump::<
+                    vpp_api::generated::interface::SwInterfaceDump,
+                    vpp_api::generated::interface::SwInterfaceDetails,
+                >(vpp_api::generated::interface::SwInterfaceDump::default())
+                .await?;
+        }
+        if vpp_interfaces.is_empty() {
+            tracing::warn!(
+                "VPP interface dump empty after retries — interfaces will not enroll this pass"
+            );
+        }
+    }
 
     // Build a V2Setup for every v2 cfg. Failed setups (interface
     // resolution dies, VPP returns garbage, etc.) get logged but
