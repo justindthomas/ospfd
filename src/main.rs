@@ -387,6 +387,50 @@ async fn register_punt_v4(
     Ok(server)
 }
 
+/// Program 224.0.0.5/6 (*,G) local-receive mfib entries so VPP punts OSPFv2
+/// hellos to our registered socket on every enrolled interface. Without this
+/// VPP drops link-local OSPF multicast before the proto-89 punt — the v4
+/// analogue of `daemon_v3::program_v6_mcast_mfib`. Works for physical NICs,
+/// sub-interfaces, and GRE tunnels alike, so OSPF never needs a linux_cp TAP.
+async fn program_v4_mcast_mfib(
+    vpp: &vpp_api::VppClient,
+    sw_if_indexes: &[u32],
+) -> anyhow::Result<()> {
+    use vpp_api::generated::ip::{
+        IpMroute, IpMrouteAddDel, IpMrouteAddDelReply, MfibPath, Mprefix,
+    };
+    // 224.0.0.5 (AllSPFRouters), 224.0.0.6 (AllDRRouters).
+    const GROUPS: [[u8; 4]; 2] = [[224, 0, 0, 5], [224, 0, 0, 6]];
+    for grp in GROUPS {
+        let mut paths = vec![MfibPath::local_receive_ipv4()];
+        paths.extend(sw_if_indexes.iter().map(|&i| MfibPath::accept_ipv4(i)));
+        for path in paths {
+            let req = IpMrouteAddDel {
+                is_add: true,
+                is_multipath: true,
+                route: IpMroute {
+                    table_id: 0,
+                    entry_flags: 0,
+                    rpf_id: 0,
+                    prefix: Mprefix::ipv4_group(grp, 32),
+                    paths: vec![path],
+                },
+            };
+            let reply: IpMrouteAddDelReply = vpp
+                .request::<IpMrouteAddDel, IpMrouteAddDelReply>(req)
+                .await
+                .map_err(|e| anyhow::anyhow!("ip_mroute_add_del (v4 mcast): {}", e))?;
+            if reply.retval != 0 {
+                tracing::warn!(
+                    retval = reply.retval,
+                    "ip4 multicast mfib add returned non-zero"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Return the effective L2 MAC address for an interface, falling
 /// back to the parent's address if the interface itself reports
 /// all-zeros. VPP's `sw_interface_dump` populates `l2_address` only
@@ -1844,6 +1888,18 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 let _ = std::fs::create_dir_all("/run/ospfd");
                 let client_path = "/run/ospfd/punt-v4.sock";
                 let vpp_server_path = register_punt_v4(&vpp, client_path).await?;
+                // Program 224.0.0.5/6 local-receive mfib entries so VPP delivers
+                // OSPF hellos to our punt on every enrolled interface — including
+                // GRE tunnels. The v4 analogue of program_v6_mcast_mfib; no
+                // linux_cp TAP needed for OSPF I/O.
+                let v4_sw_if_indexes: Vec<u32> =
+                    all_ifaces.iter().map(|i| i.sw_if_index).collect();
+                if let Err(e) = program_v4_mcast_mfib(&vpp, &v4_sw_if_indexes).await {
+                    tracing::warn!(
+                        error = %e,
+                        "OSPFv2 multicast mfib programming failed; adjacencies may not form"
+                    );
+                }
                 let punt = PuntSocketIo::new(all_ifaces, client_path, vpp_server_path)?;
                 let (rx, tx) = punt.into_split();
 
