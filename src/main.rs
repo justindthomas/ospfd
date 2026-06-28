@@ -1896,7 +1896,8 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 &vpp_interfaces,
                 args.io_backend,
                 &args.vpp_api_socket,
-                &mut sighup_tx.subscribe(),
+                args.config_path.clone(),
+                sighup_tx.subscribe(),
             )
             .await
         } else {
@@ -1984,7 +1985,8 @@ async fn spawn_v3_instance(
     vpp_interfaces: &[vpp_api::generated::interface::SwInterfaceDetails],
     io_backend: IoBackend,
     vpp_api_socket: &str,
-    _sighup_rx: &mut broadcast::Receiver<()>,
+    config_path: std::path::PathBuf,
+    sighup_rx: broadcast::Receiver<()>,
 ) -> Option<(Option<String>, Arc<Mutex<InstanceV3>>)> {
     let mut v3_ifaces = Vec::new();
     for ic in &v3_config.interfaces {
@@ -2108,7 +2110,9 @@ async fn spawn_v3_instance(
                 }
             }
         };
-        if let Err(e) = daemon_v3::run(v3_cfg, owned, v3_inst_clone).await {
+        if let Err(e) =
+            daemon_v3::run(v3_cfg, owned, v3_inst_clone, config_path, sighup_rx).await
+        {
             tracing::error!("OSPFv3 daemon exited: {}", e);
         }
     });

@@ -120,6 +120,8 @@ pub async fn run(
     mut cfg: V3DaemonConfig,
     vpp: vpp_api::VppClient,
     instance: Arc<Mutex<InstanceV3>>,
+    config_path: std::path::PathBuf,
+    mut sighup_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     if cfg.interfaces.is_empty() {
         tracing::info!("OSPFv3: no interfaces configured, not starting");
@@ -354,6 +356,34 @@ pub async fn run(
                 let mut inst = instance.lock().await;
                 if let Err(e) = inst.handle_rx(rx) {
                     tracing::debug!("OSPFv3 rx error: {}", e);
+                }
+            }
+
+            r = sighup_rx.recv() => {
+                if r.is_err() {
+                    // Sender dropped — process shutting down. Exit cleanly.
+                    return Ok(());
+                }
+                tracing::info!(
+                    path = %config_path.display(),
+                    vrf = ?cfg.vrf_name,
+                    "OSPFv3 SIGHUP: reloading config"
+                );
+                // Re-read the v3 config and apply in place (priority, cost,
+                // timers). Interface adds/removes and area/network-type changes
+                // still need a daemon restart (handled by ecrd's supervisor).
+                match crate::config::Ospf6DaemonConfig::load_all(&config_path) {
+                    Ok(configs) => {
+                        if let Some(new_cfg) =
+                            configs.into_iter().find(|c| c.vrf_name == cfg.vrf_name)
+                        {
+                            let mut inst = instance.lock().await;
+                            if inst.reload_config(&new_cfg) {
+                                tracing::info!(vrf = ?cfg.vrf_name, "OSPFv3 reload applied");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("OSPFv3 reload: re-read failed: {}", e),
                 }
             }
 
