@@ -336,6 +336,19 @@ impl InstanceV3 {
                 live.needs_router_lsa_refresh = true;
                 changed = true;
             }
+            if live.cost != new_iface.cost {
+                tracing::info!(
+                    name = %live.io.name,
+                    old = live.cost,
+                    new = new_iface.cost,
+                    "reload (v3): cost"
+                );
+                live.cost = new_iface.cost;
+                // Cost is the Router-LSA link metric, so re-originate.
+                router_lsa_dirty = true;
+                live.needs_router_lsa_refresh = true;
+                changed = true;
+            }
             if live.hello_interval != new_iface.hello_interval {
                 tracing::info!(
                     name = %live.io.name,
