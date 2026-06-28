@@ -51,7 +51,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::net::UnixDatagram as StdUnixDatagram;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc;
@@ -129,19 +129,50 @@ impl PuntSocketRx {
 /// `StdUnixDatagram::send_to` is kernel-atomic.
 #[derive(Clone)]
 pub struct PuntSocketTx {
-    interfaces: Arc<HashMap<u32, IoInterface>>,
+    /// Shared with the RX reader task (see `PuntSocketIo`) so a
+    /// dynamically-enrolled interface (a GRE tunnel created after the
+    /// daemon started) is visible to both TX framing and the RX
+    /// sanity check the moment `enroll` runs. `std::sync::RwLock`
+    /// because `send` is a synchronous call off the async event loop
+    /// and the critical section is a single map lookup / insert.
+    interfaces: Arc<RwLock<HashMap<u32, IoInterface>>>,
     tx: Arc<StdUnixDatagram>,
     vpp_server_path: Arc<String>,
 }
 
 impl PuntSocketTx {
     pub fn send(&self, packet: &TxPacket) -> std::io::Result<()> {
-        let iface = self.interfaces.get(&packet.sw_if_index).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("unknown sw_if_index {}", packet.sw_if_index),
+        // Copy the small per-interface bits out of the locked map so we
+        // don't hold the read guard across the (cheap) packet build.
+        let (mac_address, outer_vlan_id, inner_vlan_id, l3_peer) = {
+            let ifaces = self.interfaces.read().unwrap();
+            let iface = ifaces.get(&packet.sw_if_index).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("unknown sw_if_index {}", packet.sw_if_index),
+                )
+            })?;
+            (
+                iface.mac_address,
+                iface.outer_vlan_id,
+                iface.inner_vlan_id,
+                iface.l3_peer,
             )
-        })?;
+        };
+
+        // Point-to-point L3 tunnel (GRE/IPIP): no L2 to frame. Send the
+        // AllSPFRouters multicast hello as a unicast to the tunnel peer
+        // via PUNT_IP4_ROUTED so ip4-lookup stitches the GRE mid-chain
+        // adjacency and encapsulates it. See `IoInterface::l3_peer`.
+        if let (true, Some(peer)) = (is_multicast_v4(&packet.dst_addr), l3_peer) {
+            let ip_pkt = build_ip_packet(&packet.src_addr, &peer, &packet.data);
+            let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + ip_pkt.len());
+            dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
+            dgram.extend_from_slice(&PUNT_ACTION_IP4_ROUTED.to_le_bytes());
+            dgram.extend_from_slice(&ip_pkt);
+            self.tx.send_to(&dgram, self.vpp_server_path.as_str())?;
+            return Ok(());
+        }
 
         let ip_pkt = build_ip_packet(&packet.src_addr, &packet.dst_addr, &packet.data);
 
@@ -149,9 +180,9 @@ impl PuntSocketTx {
             let dst_mac = multicast_mac_v4(&packet.dst_addr);
             let frame = build_punt_l2_frame(
                 dst_mac,
-                iface.mac_address,
-                iface.outer_vlan_id,
-                iface.inner_vlan_id,
+                mac_address,
+                outer_vlan_id,
+                inner_vlan_id,
                 0x0800, // ethertype IPv4
                 &ip_pkt,
             );
@@ -170,8 +201,21 @@ impl PuntSocketTx {
         Ok(())
     }
 
-    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
-        self.interfaces.get(&sw_if_index)
+    /// Add (or replace) an interface in the shared map after the daemon
+    /// has already started — used by the enrolment task when a GRE
+    /// tunnel that was absent at boot finally appears in VPP. Visible
+    /// immediately to both `send` and the RX reader task.
+    pub fn enroll(&self, iface: IoInterface) {
+        self.interfaces
+            .write()
+            .unwrap()
+            .insert(iface.sw_if_index, iface);
+    }
+
+    /// True if `sw_if_index` is already enrolled. Lets the enrolment
+    /// task skip interfaces it has already wired up.
+    pub fn is_enrolled(&self, sw_if_index: u32) -> bool {
+        self.interfaces.read().unwrap().contains_key(&sw_if_index)
     }
 }
 
@@ -183,8 +227,10 @@ impl PuntSocketTx {
 /// channel that the daemon's select loop consumes.
 pub struct PuntSocketIo {
     /// Map sw_if_index -> interface info (name, address, MAC, etc.).
-    /// Populated from the `interfaces` vec passed to `new`.
-    interfaces: HashMap<u32, IoInterface>,
+    /// Populated from the `interfaces` vec passed to `new`, then shared
+    /// (same `Arc`) with the reader task and — after `into_split` — the
+    /// `PuntSocketTx` clones, so a late `enroll` is seen everywhere.
+    interfaces: Arc<RwLock<HashMap<u32, IoInterface>>>,
     /// TX socket (unbound unix-datagram). VPP's listening socket is
     /// at `vpp_server_path` — we `send_to` that for each outbound
     /// packet.
@@ -235,20 +281,21 @@ impl PuntSocketIo {
 
         let iface_map: HashMap<u32, IoInterface> =
             interfaces.into_iter().map(|i| (i.sw_if_index, i)).collect();
+        let iface_count = iface_map.len();
+        let interfaces = Arc::new(RwLock::new(iface_map));
 
         let (chan_tx, chan_rx) = mpsc::channel::<RxPacket>(256);
-        let iface_map_for_reader = Arc::new(iface_map.clone());
-        let reader = tokio::spawn(reader_task(async_rx, chan_tx, iface_map_for_reader));
+        let reader = tokio::spawn(reader_task(async_rx, chan_tx, Arc::clone(&interfaces)));
 
         tracing::info!(
             client = client_socket_path,
             vpp_server = vpp_server_path.as_str(),
-            interfaces = iface_map.len(),
+            interfaces = iface_count,
             "PuntSocketIo ready"
         );
 
         Ok(PuntSocketIo {
-            interfaces: iface_map,
+            interfaces,
             tx,
             vpp_server_path,
             rx: chan_rx,
@@ -282,7 +329,7 @@ impl PuntSocketIo {
                 _reader_task,
             },
             PuntSocketTx {
-                interfaces: Arc::new(interfaces),
+                interfaces,
                 tx: Arc::new(tx),
                 vpp_server_path: Arc::new(vpp_server_path),
             },
@@ -316,73 +363,12 @@ impl PuntSocketIo {
             "PuntSocketIo no-op (no enrolled interfaces, skipping VPP punt register)"
         );
         Ok(PuntSocketIo {
-            interfaces: iface_map,
+            interfaces: Arc::new(RwLock::new(iface_map)),
             tx,
             vpp_server_path: String::new(),
             rx: chan_rx,
             _reader_task: reader,
         })
-    }
-
-    pub async fn recv(&mut self) -> Option<RxPacket> {
-        self.rx.recv().await
-    }
-
-    pub fn send(&self, packet: &TxPacket) -> std::io::Result<()> {
-        let iface = self.interfaces.get(&packet.sw_if_index).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("unknown sw_if_index {}", packet.sw_if_index),
-            )
-        })?;
-
-        // Build the IP header. The raw-socket backend lets the kernel
-        // do this; for punt we have to construct it ourselves because
-        // VPP expects a full IP packet in the punt datagram, not just
-        // OSPF payload.
-        let ip_pkt = build_ip_packet(
-            &packet.src_addr,
-            &packet.dst_addr,
-            &packet.data,
-        );
-
-        // Pick the injection mode based on destination class. See the
-        // module-level doc for why.
-        if is_multicast_v4(&packet.dst_addr) {
-            // PUNT_L2: enqueue directly at <iface>-output. Need a full
-            // L2 frame (ethernet header + optional 802.1Q tag(s) +
-            // IP packet). VPP does NOT run ip4-rewrite on PUNT_L2,
-            // so for a sub-interface we must push the vlan tag
-            // ourselves or the frame egresses untagged and the
-            // trunked peer drops it onto the native vlan.
-            let dst_mac = multicast_mac_v4(&packet.dst_addr);
-            let frame = build_punt_l2_frame(
-                dst_mac,
-                iface.mac_address,
-                iface.outer_vlan_id,
-                iface.inner_vlan_id,
-                0x0800, // ethertype IPv4
-                &ip_pkt,
-            );
-            let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + frame.len());
-            dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
-            dgram.extend_from_slice(&PUNT_ACTION_L2.to_le_bytes());
-            dgram.extend_from_slice(&frame);
-            self.tx.send_to(&dgram, &self.vpp_server_path)?;
-        } else {
-            // PUNT_IP4_ROUTED: let VPP's ip4-lookup + ip4-rewrite
-            // handle FIB lookup and L2 construction.
-            let mut dgram = Vec::with_capacity(PUNT_DESC_LEN + ip_pkt.len());
-            dgram.extend_from_slice(&packet.sw_if_index.to_le_bytes());
-            dgram.extend_from_slice(&PUNT_ACTION_IP4_ROUTED.to_le_bytes());
-            dgram.extend_from_slice(&ip_pkt);
-            self.tx.send_to(&dgram, &self.vpp_server_path)?;
-        }
-        Ok(())
-    }
-
-    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
-        self.interfaces.get(&sw_if_index)
     }
 }
 
@@ -494,7 +480,7 @@ fn ip_header_checksum(header_bytes: &[u8]) -> u16 {
 async fn reader_task(
     sock: UnixDatagram,
     chan: mpsc::Sender<RxPacket>,
-    interfaces: Arc<HashMap<u32, IoInterface>>,
+    interfaces: Arc<RwLock<HashMap<u32, IoInterface>>>,
 ) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -575,8 +561,9 @@ async fn reader_task(
         }
         let data = buf[l3_off + ihl..payload_end].to_vec();
 
-        // Sanity check: we know this sw_if_index?
-        if !interfaces.contains_key(&sw_if_index) {
+        // Sanity check: we know this sw_if_index? (Read the shared map
+        // each packet so a dynamically-enrolled tunnel is recognised.)
+        if !interfaces.read().unwrap().contains_key(&sw_if_index) {
             tracing::debug!(
                 sw_if_index,
                 "punt packet on unknown interface; dropping"

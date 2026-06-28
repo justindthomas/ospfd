@@ -64,6 +64,26 @@ pub struct IoInterface {
     /// 802.1Q inner VLAN tag for QinQ sub-interfaces, `None`
     /// otherwise. From `sub_inner_vlan_id` in sw_interface_dump.
     pub inner_vlan_id: Option<u16>,
+    /// Remote overlay address for a point-to-point L3 tunnel
+    /// (GRE / IPIP), `None` for an ordinary Ethernet interface.
+    ///
+    /// A GRE tunnel has no L2 — the PUNT_L2 multicast egress path
+    /// (build an ethernet frame, enqueue at `<iface>-output`) skips
+    /// the tunnel's mid-chain encap and the frame leaves unencapped,
+    /// so the peer never sees it. Programming the (*,G) mfib with a
+    /// FORWARD bucket on the tunnel instead would replicate *every*
+    /// accepted ingress hello out the tunnel (the replicate list is
+    /// shared per group), leaking neighbours' hellos onto the link.
+    ///
+    /// So for a numbered p2p tunnel we side-step both: send the
+    /// AllSPFRouters hello as a *unicast* to this peer address via
+    /// PUNT_IP4_ROUTED — ip4-lookup resolves the connected route,
+    /// stitches the GRE mid-chain adjacency, and encapsulates. The
+    /// peer accepts a unicast OSPF packet addressed to its own
+    /// interface (RFC 2328 §10.5). Computed from the local address +
+    /// mask at enrolment for /30 and /31 tunnels; see
+    /// `compute_l3_peer` in main.rs.
+    pub l3_peer: Option<Ipv4Addr>,
 }
 
 /// Raw-socket I/O for OSPF packets.
@@ -365,47 +385,6 @@ fn set_multicast_if(fd: RawFd, ifindex: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// OSPFv2 I/O backend — dispatches to the selected transport
-/// implementation. Introduced to let the daemon choose between the
-/// legacy raw-socket-on-LCP-TAP path and a VPP punt-socket path at
-/// runtime via a CLI flag. Both variants share the same RxPacket /
-/// TxPacket data shapes, so the protocol code above doesn't care
-/// which backend is in play.
-///
-/// Variants:
-///   Raw  — AF_INET/SOCK_RAW bound to each LCP TAP. Linux-only.
-///          Reuses the long-standing implementation in this file.
-///   Punt — VPP active-punt socket for IP proto 89. Requires
-///          `punt { socket /run/vpp/punt-server.sock }` in VPP's
-///          startup.conf. See io_punt.rs for the implementation.
-pub enum Ospfv2Io {
-    Raw(RawSocketIo),
-    Punt(crate::io_punt::PuntSocketIo),
-}
-
-impl Ospfv2Io {
-    pub async fn recv(&mut self) -> Option<RxPacket> {
-        match self {
-            Ospfv2Io::Raw(io) => io.recv().await,
-            Ospfv2Io::Punt(io) => io.recv().await,
-        }
-    }
-
-    pub fn send(&self, packet: &TxPacket) -> std::io::Result<()> {
-        match self {
-            Ospfv2Io::Raw(io) => io.send(packet),
-            Ospfv2Io::Punt(io) => io.send(packet),
-        }
-    }
-
-    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
-        match self {
-            Ospfv2Io::Raw(io) => io.interface(sw_if_index),
-            Ospfv2Io::Punt(io) => io.interface(sw_if_index),
-        }
-    }
-}
-
 /// Per-OSPF-instance I/O handle inside a multi-instance ospfd
 /// process. Each VRF gets exactly one of these. The Raw variant
 /// owns its sockets (raw sockets are per-iface so per-instance
@@ -438,13 +417,6 @@ impl InstanceIo {
         match self {
             InstanceIo::Raw(io) => io.send(packet),
             InstanceIo::Punt(io) => io.tx.send(packet),
-        }
-    }
-
-    pub fn interface(&self, sw_if_index: u32) -> Option<&IoInterface> {
-        match self {
-            InstanceIo::Raw(io) => io.interface(sw_if_index),
-            InstanceIo::Punt(io) => io.tx.interface(sw_if_index),
         }
     }
 }

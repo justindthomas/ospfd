@@ -466,6 +466,65 @@ fn effective_l2_address(
     [0u8; 6]
 }
 
+/// Derive the remote overlay address for a point-to-point L3 tunnel
+/// (GRE / IPIP), or `None` for an ordinary Ethernet interface. The
+/// result populates `IoInterface::l3_peer`, which drives the
+/// unicast-to-peer multicast-egress path in `PuntSocketTx::send` (see
+/// that field's doc for why a tunnel can't use PUNT_L2).
+///
+/// A tunnel is identified by VPP's `interface_dev_type` ("GRE
+/// tunnel" / "IPIP tunnel") with a name-prefix fallback. The peer is
+/// computed from the local address + mask:
+///   - /31 (RFC 3021): the address pair differ only in the low bit.
+///   - /30: two host addresses (network+1, network+2); the peer is
+///     whichever one we are not.
+/// Any other prefix length on a tunnel can't name a single peer, so
+/// we warn and return `None` (hellos won't egress until it's a /30 or
+/// /31 — which is what GRE p2p tunnels use in practice).
+fn compute_l3_peer(
+    name: &str,
+    dev_type: &str,
+    address: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> Option<std::net::Ipv4Addr> {
+    let d = dev_type.to_ascii_lowercase();
+    let is_tunnel = d.contains("gre")
+        || d.contains("ipip")
+        || d.contains("tunnel")
+        || name.starts_with("gre")
+        || name.starts_with("ipip");
+    if !is_tunnel {
+        return None;
+    }
+    let addr = u32::from(address);
+    let m = u32::from(mask);
+    match (!m).count_ones() {
+        1 => Some(std::net::Ipv4Addr::from(addr ^ 1)),
+        2 => {
+            let net = addr & m;
+            let h1 = net | 1;
+            let h2 = net | 2;
+            if addr == h1 {
+                Some(std::net::Ipv4Addr::from(h2))
+            } else if addr == h2 {
+                Some(std::net::Ipv4Addr::from(h1))
+            } else {
+                None
+            }
+        }
+        _ => {
+            tracing::warn!(
+                iface = name,
+                addr = %address,
+                "L3 tunnel with a non-/30,/31 prefix; cannot derive the OSPF \
+                 hello peer — multicast hellos over this tunnel will not \
+                 egress. Use a /30 or /31 on the tunnel.",
+            );
+            None
+        }
+    }
+}
+
 fn get_kernel_ifindex(name: &str) -> anyhow::Result<u32> {
     let path = format!("/sys/class/net/{}/ifindex", name);
     let contents = std::fs::read_to_string(&path)
@@ -1546,6 +1605,12 @@ async fn build_v2_setup(
             mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
             outer_vlan_id,
             inner_vlan_id,
+            l3_peer: compute_l3_peer(
+                &iface.name,
+                &vpp_iface.interface_dev_type,
+                iface.address,
+                iface.mask,
+            ),
         });
     }
 
@@ -1632,11 +1697,14 @@ async fn build_v2_setup(
 /// quietly.
 async fn v4_dispatcher(
     mut rx: ospfd::io_punt::PuntSocketRx,
-    iface_to_idx: HashMap<u32, usize>,
+    iface_to_idx: Arc<std::sync::RwLock<HashMap<u32, usize>>>,
     senders: Vec<mpsc::Sender<RxPacket>>,
 ) {
     while let Some(pkt) = rx.recv().await {
-        dispatch_one(&iface_to_idx, &senders, pkt).await;
+        // Snapshot the lookup under a short read lock — the enrolment
+        // task may insert a late-resolving tunnel's mapping at any time.
+        let map = iface_to_idx.read().unwrap().clone();
+        dispatch_one(&map, &senders, pkt).await;
     }
 }
 
@@ -1658,6 +1726,153 @@ async fn dispatch_one(
         return None;
     }
     Some(idx)
+}
+
+/// Background task (punt mode) that resolves OSPF interfaces which were
+/// absent from VPP when the daemon started — typically a GRE tunnel
+/// created at boot, torn down by the af_xdp VPP restart, then recreated
+/// by a later `imp commit`. The 30s startup wait in `run_daemon` gives
+/// up on such interfaces, leaving them in the instance with
+/// `sw_if_index == 0` (state Down). This task periodically re-dumps VPP
+/// and, for each still-unresolved interface that now exists, resolves
+/// its sw_if_index + address, brings it up, re-originates the Router-LSA,
+/// and wires it into the punt TX map, the dispatcher's RX routing map,
+/// and the multicast mfib so OSPF I/O flows.
+///
+/// Scope note: only interfaces with `sw_if_index == 0` are (re)enrolled.
+/// An interface that resolved once and was later torn down keeps its
+/// stale index and is not re-resolved here — fine for the boot-flap case
+/// this targets; full churn handling is a follow-up.
+async fn enrollment_task(
+    vpp: Arc<vpp_api::VppClient>,
+    tx: ospfd::io_punt::PuntSocketTx,
+    iface_to_idx: Arc<std::sync::RwLock<HashMap<u32, usize>>>,
+    instances: Vec<(usize, Arc<Mutex<OspfInstance>>)>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+
+        // Gather (idx, instance, unresolved-names) without holding a
+        // lock across the VPP dump below.
+        let mut pending: Vec<(usize, Arc<Mutex<OspfInstance>>, Vec<String>)> = Vec::new();
+        for (idx, inst_arc) in &instances {
+            let names: Vec<String> = {
+                let inst = inst_arc.lock().await;
+                inst.interfaces
+                    .iter()
+                    .filter(|i| i.sw_if_index == 0)
+                    .map(|i| i.name.clone())
+                    .collect()
+            };
+            if !names.is_empty() {
+                pending.push((*idx, inst_arc.clone(), names));
+            }
+        }
+        if pending.is_empty() {
+            continue; // everything resolved — skip the dump entirely
+        }
+
+        let vpp_ifaces = vpp
+            .dump::<
+                vpp_api::generated::interface::SwInterfaceDump,
+                vpp_api::generated::interface::SwInterfaceDetails,
+            >(vpp_api::generated::interface::SwInterfaceDump::default())
+            .await
+            .unwrap_or_default();
+
+        for (idx, inst_arc, names) in pending {
+            for name in names {
+                let Some(vi) = vpp_ifaces.iter().find(|v| v.interface_name == name) else {
+                    continue; // still not in VPP
+                };
+                if tx.is_enrolled(vi.sw_if_index) {
+                    continue; // already wired
+                }
+
+                // VPP is authoritative for the address.
+                let v4 = vpp
+                    .dump::<
+                        vpp_api::generated::ip::IpAddressDump,
+                        vpp_api::generated::ip::IpAddressDetails,
+                    >(vpp_api::generated::ip::IpAddressDump {
+                        sw_if_index: vi.sw_if_index,
+                        is_ipv6: false,
+                    })
+                    .await
+                    .unwrap_or_default();
+                let vpp_addr_mask = v4.first().map(|d| {
+                    let octets = [
+                        d.prefix.address[0],
+                        d.prefix.address[1],
+                        d.prefix.address[2],
+                        d.prefix.address[3],
+                    ];
+                    let addr = std::net::Ipv4Addr::from(octets);
+                    let mask_bits: u32 = if d.prefix.len == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - d.prefix.len as u32)
+                    };
+                    (addr, std::net::Ipv4Addr::from(mask_bits))
+                });
+
+                // Update the instance: set index/address, bring up,
+                // re-originate the Router-LSA, schedule SPF.
+                let (addr, mask) = {
+                    let mut inst = inst_arc.lock().await;
+                    let Some(iface) = inst
+                        .interfaces
+                        .iter_mut()
+                        .find(|i| i.name == name && i.sw_if_index == 0)
+                    else {
+                        continue; // resolved elsewhere meanwhile
+                    };
+                    iface.sw_if_index = vi.sw_if_index;
+                    if let Some((addr, mask)) = vpp_addr_mask {
+                        iface.address = addr;
+                        iface.mask = mask;
+                    }
+                    iface.handle_event(&InterfaceEvent::InterfaceUp);
+                    let resolved = (iface.address, iface.mask);
+                    inst.originate_router_lsa();
+                    inst.schedule_spf();
+                    resolved
+                };
+
+                let l3_peer = compute_l3_peer(&name, &vi.interface_dev_type, addr, mask);
+                tx.enroll(IoInterface {
+                    name: name.clone(),
+                    sw_if_index: vi.sw_if_index,
+                    kernel_ifindex: get_kernel_ifindex(&name).unwrap_or(0),
+                    address: addr,
+                    mac_address: effective_l2_address(vi, &vpp_ifaces),
+                    outer_vlan_id: (vi.sub_outer_vlan_id != 0).then_some(vi.sub_outer_vlan_id),
+                    inner_vlan_id: (vi.sub_inner_vlan_id != 0).then_some(vi.sub_inner_vlan_id),
+                    l3_peer,
+                });
+                iface_to_idx.write().unwrap().insert(vi.sw_if_index, idx);
+
+                if let Err(e) = program_v4_mcast_mfib(&vpp, &[vi.sw_if_index]).await {
+                    tracing::warn!(
+                        iface = %name,
+                        error = %e,
+                        "mfib programming failed for dynamically-enrolled interface",
+                    );
+                }
+
+                tracing::info!(
+                    iface = %name,
+                    sw_if_index = vi.sw_if_index,
+                    address = %addr,
+                    l3_peer = ?l3_peer,
+                    instance = idx,
+                    "dynamically enrolled OSPFv2 interface",
+                );
+            }
+        }
+    }
 }
 
 async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
@@ -1861,6 +2076,20 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                     iface_to_idx.insert(io.sw_if_index, idx);
                 }
             }
+            // Shared so the enrolment task can add a late-resolving
+            // tunnel's mapping while the dispatcher keeps reading it.
+            let iface_to_idx = Arc::new(std::sync::RwLock::new(iface_to_idx));
+
+            // (instance-index, instance handle) for every v2 VRF, in
+            // the SAME order as senders/receivers and the task spawn
+            // loop below — so an enrolled tunnel's sw_if_index maps to
+            // the right instance. Used by the enrolment task to find
+            // and resolve interfaces that were absent from VPP at boot.
+            let enroll_instances: Vec<(usize, Arc<Mutex<OspfInstance>>)> = v2_setups
+                .iter()
+                .enumerate()
+                .map(|(idx, s)| (idx, s.instance.clone()))
+                .collect();
 
             if all_ifaces.is_empty() {
                 // No instance enrolls any interface — skip the VPP
@@ -1903,7 +2132,19 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
                 let punt = PuntSocketIo::new(all_ifaces, client_path, vpp_server_path)?;
                 let (rx, tx) = punt.into_split();
 
-                tokio::spawn(v4_dispatcher(rx, iface_to_idx, senders));
+                tokio::spawn(v4_dispatcher(rx, Arc::clone(&iface_to_idx), senders));
+
+                // Dynamically enrol interfaces that were absent from VPP
+                // at boot (the classic case: a GRE tunnel created at boot
+                // then torn down by the af_xdp VPP restart, recreated by a
+                // later apply). Without this they sit Down forever — the
+                // 30s startup wait already timed out on them.
+                tokio::spawn(enrollment_task(
+                    vpp.clone(),
+                    tx.clone(),
+                    Arc::clone(&iface_to_idx),
+                    enroll_instances,
+                ));
 
                 receivers
                     .into_iter()
@@ -2187,6 +2428,83 @@ mod tests {
             dst_addr: Ipv4Addr::new(224, 0, 0, 5),
             data: vec![],
         }
+    }
+
+    #[test]
+    fn l3_peer_slash30() {
+        // 10.255.0.2/30: network .0, hosts .1/.2, bcast .3 → peer .1.
+        assert_eq!(
+            compute_l3_peer(
+                "gre0",
+                "GRE tunnel",
+                Ipv4Addr::new(10, 255, 0, 2),
+                Ipv4Addr::new(255, 255, 255, 252),
+            ),
+            Some(Ipv4Addr::new(10, 255, 0, 1)),
+        );
+        // The other end resolves symmetrically.
+        assert_eq!(
+            compute_l3_peer(
+                "gre0",
+                "GRE tunnel",
+                Ipv4Addr::new(10, 255, 0, 1),
+                Ipv4Addr::new(255, 255, 255, 252),
+            ),
+            Some(Ipv4Addr::new(10, 255, 0, 2)),
+        );
+    }
+
+    #[test]
+    fn l3_peer_slash31() {
+        // 10.0.0.4/31 (RFC 3021) pairs with 10.0.0.5.
+        assert_eq!(
+            compute_l3_peer(
+                "gre1",
+                "GRE tunnel",
+                Ipv4Addr::new(10, 0, 0, 4),
+                Ipv4Addr::new(255, 255, 255, 254),
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 5)),
+        );
+    }
+
+    #[test]
+    fn l3_peer_only_for_tunnels() {
+        // An ordinary Ethernet interface gets no peer — it uses the
+        // PUNT_L2 multicast path, not unicast-to-peer.
+        assert_eq!(
+            compute_l3_peer(
+                "wan",
+                "dpdk",
+                Ipv4Addr::new(172, 30, 0, 2),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+            None,
+        );
+        // Tunnel detected by name prefix even if dev_type is unknown.
+        assert_eq!(
+            compute_l3_peer(
+                "gre0",
+                "",
+                Ipv4Addr::new(10, 255, 0, 2),
+                Ipv4Addr::new(255, 255, 255, 252),
+            ),
+            Some(Ipv4Addr::new(10, 255, 0, 1)),
+        );
+    }
+
+    #[test]
+    fn l3_peer_unsupported_prefix() {
+        // A tunnel with a wider prefix can't name a single peer.
+        assert_eq!(
+            compute_l3_peer(
+                "gre0",
+                "GRE tunnel",
+                Ipv4Addr::new(10, 255, 0, 2),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+            None,
+        );
     }
 
     #[tokio::test]
