@@ -1692,13 +1692,64 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         });
     }
 
-    // One shared interface dump for every instance to read against.
-    let vpp_interfaces = vpp
+    // One shared interface dump for every instance (v2 + v3) to read against.
+    // ospfd is (re)spawned the moment VPP binds its API socket — which can
+    // pre-date commands-core.txt creating the dataplane interfaces — so the
+    // first dump is often just `local0`, or a partial set. A non-empty-but-
+    // incomplete dump (the common race: local0 present, wan/lan not yet) makes
+    // build_v2_setup / spawn_v3_instance skip those interfaces, and the daemon
+    // then sits idle with no adjacencies — suite-wide, with no recovery. So
+    // poll until every configured OSPF interface is present, not merely until
+    // the dump is non-empty. v3 interfaces are a subset of the v2 set (the same
+    // physical TAPs), but include both to be safe.
+    let expected_ifaces: std::collections::HashSet<String> = v2_configs
+        .iter()
+        .flat_map(|c| c.interfaces.iter())
+        .map(|ic| ic.name.clone())
+        .chain(
+            v3_config_first
+                .iter()
+                .flat_map(|c| c.interfaces.iter())
+                .map(|ic| ic.name.clone()),
+        )
+        .collect();
+    let mut vpp_interfaces = vpp
         .dump::<
             vpp_api::generated::interface::SwInterfaceDump,
             vpp_api::generated::interface::SwInterfaceDetails,
         >(vpp_api::generated::interface::SwInterfaceDump::default())
         .await?;
+    if !expected_ifaces.is_empty() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let missing: Vec<&str> = expected_ifaces
+                .iter()
+                .filter(|name| {
+                    !vpp_interfaces
+                        .iter()
+                        .any(|vi| vi.interface_name.as_str() == name.as_str())
+                })
+                .map(|s| s.as_str())
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    ?missing,
+                    "configured OSPF interfaces absent from VPP after 30s; they will not enroll this pass"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            vpp_interfaces = vpp
+                .dump::<
+                    vpp_api::generated::interface::SwInterfaceDump,
+                    vpp_api::generated::interface::SwInterfaceDetails,
+                >(vpp_api::generated::interface::SwInterfaceDump::default())
+                .await?;
+        }
+    }
 
     // Build a V2Setup for every v2 cfg. Failed setups (interface
     // resolution dies, VPP returns garbage, etc.) get logged but
