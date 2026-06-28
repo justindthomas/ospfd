@@ -790,6 +790,31 @@ impl OspfInstance {
                 InstallResult::Duplicate => {
                     // Acknowledge anyway (implicit ack)
                     ack_headers.push(lsa.header.clone());
+
+                    // RFC 2328 §13: receiving an LSA that is the same
+                    // instance as one on our Link State Request list is an
+                    // implied acknowledgment — drop it from the request
+                    // list even though the LSDB already held it. Without
+                    // this, a requested LSA we also installed via a
+                    // concurrent flood (so it lands here as Duplicate, not
+                    // New) never leaves the request list, and the neighbor
+                    // wedges in Loading re-sending LSRs forever. Seen
+                    // deterministically over a p2p GRE tunnel, where the
+                    // flood-to-AllSPFRouters and the LSR/LSU response race.
+                    let key = lsa.key();
+                    let iface = &mut self.interfaces[iface_idx];
+                    if let Some(neighbor) = iface.neighbors.get_mut(&header.router_id) {
+                        neighbor.ls_request_list.retain(|k| *k != key);
+                        if neighbor.state == NeighborState::Loading
+                            && neighbor.ls_request_list.is_empty()
+                        {
+                            if let Some(NeighborState::Full) =
+                                neighbor.handle_event(&NeighborEvent::LoadingDone, true)
+                            {
+                                neighbor_reached_full = true;
+                            }
+                        }
+                    }
                 }
                 InstallResult::Older => {
                     // Send our newer copy back to the sender
@@ -3138,6 +3163,121 @@ mod tests {
         assert!(
             instance.interfaces[0].neighbors[&peer_rid].sent_m_clear,
             "after queue drain, sent_m_clear must be true so peer M=0 ends Exchange"
+        );
+    }
+
+    /// Regression: a requested LSA that we already hold at the same
+    /// instance (so a received LSU lands it as `Duplicate`, not `New`)
+    /// must still be removed from the neighbor's Link State Request
+    /// list — RFC 2328 §13's implied acknowledgment. Without it, the
+    /// neighbor wedges in Loading re-sending LSRs forever (seen
+    /// deterministically over a p2p GRE tunnel, where the
+    /// flood-to-AllSPFRouters and the LSR/LSU response race so the
+    /// requested LSA is already installed by the time its LSU arrives).
+    #[test]
+    fn duplicate_lsu_clears_request_list_and_completes_loading() {
+        use crate::packet::lsa::{
+            Lsa, LsaBody, LsaHeader, LsaType, RouterLink, RouterLinkType, RouterLsa,
+        };
+        use crate::proto::neighbor::{Neighbor, NeighborState};
+
+        let config = OspfDaemonConfig {
+            vrf_name: None,
+            table_id_v4: 0,
+            router_id: Ipv4Addr::new(2, 2, 2, 2),
+            reference_bandwidth: 100,
+            spf_delay_ms: 50,
+            spf_holdtime_ms: 200,
+            spf_max_holdtime_ms: 5000,
+            interfaces: vec![crate::config::OspfInterfaceConfig {
+                name: "gre0".to_string(),
+                address: Ipv4Addr::new(10, 255, 0, 2),
+                prefix_len: 30,
+                area_id: Ipv4Addr::UNSPECIFIED,
+                cost: 10,
+                passive: false,
+                network_type: "point-to-point".to_string(),
+                hello_interval: 10,
+                dead_interval: 40,
+                retransmit_interval: 5,
+                priority: 1,
+                auth_key: crate::packet::auth::AuthKey::None,
+                static_neighbors: Vec::new(),
+            }],
+            redistribute: Vec::new(),
+            areas: Vec::new(),
+            distance: None,
+            distance_intra: None,
+            distance_inter: None,
+            distance_external: None,
+            default_originate: false,
+            default_originate_metric: 1,
+            default_originate_metric_type: 2,
+            summary_addresses: Vec::new(),
+            route_maps: std::collections::HashMap::new(),
+        };
+        let mut instance = OspfInstance::new(&config);
+
+        let peer_rid = Ipv4Addr::new(1, 1, 1, 1);
+        let peer_addr = Ipv4Addr::new(10, 255, 0, 1);
+
+        // The peer's Router-LSA, already installed in our LSDB (as if a
+        // concurrent flood beat the LSR/LSU response to it).
+        let peer_lsa = Lsa {
+            header: LsaHeader {
+                ls_age: 0,
+                options: 0x02,
+                ls_type: LsaType::Router,
+                link_state_id: peer_rid,
+                advertising_router: peer_rid,
+                ls_sequence_number: 0x8000_0001u32 as i32,
+                ls_checksum: 0,
+                length: 36,
+            },
+            body: LsaBody::Router(RouterLsa {
+                flags: 0,
+                links: vec![RouterLink {
+                    link_id: Ipv4Addr::new(10, 255, 0, 0),
+                    link_data: Ipv4Addr::new(255, 255, 255, 252),
+                    link_type: RouterLinkType::StubNetwork,
+                    num_tos: 0,
+                    metric: 10,
+                }],
+            }),
+        };
+        let key = peer_lsa.key();
+        instance
+            .areas
+            .get_mut(&Ipv4Addr::UNSPECIFIED)
+            .unwrap()
+            .lsdb
+            .install(peer_lsa.clone());
+
+        // Neighbor in Loading with that LSA still pending on the
+        // request list — the wedge condition.
+        let mut neighbor = Neighbor::new(peer_rid, peer_addr);
+        neighbor.state = NeighborState::Loading;
+        neighbor.ls_request_list.push(key);
+        instance.interfaces[0].neighbors.insert(peer_rid, neighbor);
+
+        // The peer's LSU carrying the same instance → install Duplicate.
+        let lsu = crate::packet::lsu::LsUpdatePacket {
+            lsas: vec![peer_lsa.clone()],
+        };
+        let header =
+            OspfHeader::new(OspfPacketType::LinkStateUpdate, peer_rid, Ipv4Addr::UNSPECIFIED);
+        let mut responses = Vec::new();
+        instance.process_lsu(0, peer_addr, &header, &lsu, &mut responses);
+
+        let n = &instance.interfaces[0].neighbors[&peer_rid];
+        assert!(
+            n.ls_request_list.is_empty(),
+            "a Duplicate LSU for a requested LSA must clear the request list"
+        );
+        assert_eq!(
+            n.state,
+            NeighborState::Full,
+            "draining the request list in Loading must transition to Full"
         );
     }
 
