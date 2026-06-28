@@ -144,6 +144,9 @@ pub struct InterfaceV3 {
     pub retransmit_interval: u16,
     pub transmit_delay: u16,
     pub priority: u8,
+    /// Per-interface output cost (OSPFv3 link metric). From the
+    /// `ospf3.cost` config field; defaults to 10.
+    pub cost: u16,
     pub instance_id: u8,
     pub state: InterfaceStateV3,
     pub dr: Ipv4Addr,
@@ -445,8 +448,9 @@ impl InstanceV3 {
             dead_interval,
             priority,
             global_prefixes,
-            5, // retransmit_interval default
-            1, // transmit_delay default
+            5,  // retransmit_interval default
+            1,  // transmit_delay default
+            10, // cost default
         );
     }
 
@@ -464,6 +468,7 @@ impl InstanceV3 {
         global_prefixes: Vec<(Ipv6Addr, u8)>,
         retransmit_interval: u16,
         transmit_delay: u16,
+        cost: u16,
     ) {
         let interface_id = io.kernel_ifindex;
         let sw_if_index = io.sw_if_index;
@@ -488,6 +493,7 @@ impl InstanceV3 {
                 retransmit_interval,
                 transmit_delay,
                 priority,
+                cost,
                 instance_id: 0,
                 state,
                 dr: Ipv4Addr::UNSPECIFIED,
@@ -1265,7 +1271,7 @@ impl InstanceV3 {
                             if n.state == NeighborStateV3::Full {
                                 links.push(RouterLinkV3 {
                                     link_type: RouterLinkV3::TYPE_POINT_TO_POINT,
-                                    metric: 1,
+                                    metric: iface.cost,
                                     interface_id: iface.interface_id,
                                     neighbor_interface_id: n.interface_id,
                                     neighbor_router_id: n.router_id,
@@ -1290,7 +1296,7 @@ impl InstanceV3 {
                         };
                         links.push(RouterLinkV3 {
                             link_type: RouterLinkV3::TYPE_TRANSIT_NETWORK,
-                            metric: 1,
+                            metric: iface.cost,
                             interface_id: iface.interface_id,
                             neighbor_interface_id: dr_iface_id,
                             neighbor_router_id: dr,

@@ -44,6 +44,8 @@ pub struct V3InterfaceConfig {
     pub retransmit_interval: u16,
     pub transmit_delay: u16,
     pub priority: u8,
+    /// Per-interface output cost (OSPFv3 link metric), from `ospf3.cost`.
+    pub cost: u16,
     /// Static NBMA neighbors (peer link-local IPv6 + priority).
     /// Only populated and only meaningful when `network_type ==
     /// NonBroadcast`.
@@ -204,6 +206,7 @@ pub async fn run(
                 ic.global_prefixes.clone(),
                 ic.retransmit_interval,
                 ic.transmit_delay,
+                ic.cost,
             );
             if !ic.static_neighbors.is_empty() {
                 let neighbors = ic

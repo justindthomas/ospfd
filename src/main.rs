@@ -2040,6 +2040,7 @@ async fn spawn_v3_instance(
             retransmit_interval: ic.retransmit_interval,
             transmit_delay: ic.transmit_delay,
             priority: ic.priority,
+            cost: ic.cost,
             static_neighbors: ic.static_neighbors.clone(),
             mac_address: effective_l2_address(vpp_iface, vpp_interfaces),
             outer_vlan_id,

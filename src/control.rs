@@ -640,7 +640,7 @@ fn collect_interfaces_v3(inst: &InstanceV3) -> InterfacesReply {
             area_id: i.area_id.to_string(),
             state: format!("{:?}", i.state),
             network_type: format!("{:?}", i.network_type),
-            cost: 10, // v3 interfaces don't carry per-iface cost yet
+            cost: i.cost,
             priority: i.priority,
             hello_interval: i.hello_interval,
             dead_interval: i.dead_interval as u32,
