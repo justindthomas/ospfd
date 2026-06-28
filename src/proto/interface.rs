@@ -140,6 +140,18 @@ pub struct OspfInterface {
     /// FSM (and DR election in particular) has the authoritative
     /// identifier without needing a back-reference to the instance.
     pub router_id: Ipv4Addr,
+    /// Interface MTU to advertise in the Database Description packet's
+    /// Interface-MTU field (RFC 2328 §10.6). OSPF refuses adjacency on
+    /// a mismatch, so this must equal the peer's.
+    ///
+    /// Plain Ethernet uses 1500 (the working default that matches FRR
+    /// et al; VPP's reported L3 MTU is the jumbo-capable 9000 internal
+    /// value, not the on-the-wire MTU). A GRE/IPIP tunnel carries its
+    /// real IP MTU here, read from VPP at resolution — ecrd sets the
+    /// tunnel's VPP MTU to underlay-minus-overhead (1476 for GRE over a
+    /// 1500 underlay), which both ends then advertise so the check
+    /// passes without `mtu-ignore`.
+    pub dd_mtu: u16,
 }
 
 impl OspfInterface {
@@ -176,6 +188,7 @@ impl OspfInterface {
             wait_timer_expiry: None,
             auth_key: crate::packet::auth::AuthKey::None,
             crypto_seq: 0,
+            dd_mtu: 1500,
         }
     }
 

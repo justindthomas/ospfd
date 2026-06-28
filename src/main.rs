@@ -481,19 +481,46 @@ fn effective_l2_address(
 /// Any other prefix length on a tunnel can't name a single peer, so
 /// we warn and return `None` (hellos won't egress until it's a /30 or
 /// /31 — which is what GRE p2p tunnels use in practice).
+/// True if an interface is a point-to-point L3 tunnel (GRE / IPIP),
+/// identified by VPP's `interface_dev_type` ("GRE tunnel" / "IPIP
+/// tunnel") with a name-prefix fallback. Drives both the
+/// unicast-to-peer TX path (`compute_l3_peer`) and the
+/// advertise-the-real-MTU path (`build_v2_setup` / `enrollment_task`).
+fn is_l3_tunnel(name: &str, dev_type: &str) -> bool {
+    let d = dev_type.to_ascii_lowercase();
+    d.contains("gre")
+        || d.contains("ipip")
+        || d.contains("tunnel")
+        || name.starts_with("gre")
+        || name.starts_with("ipip")
+}
+
+/// IP datagram MTU VPP reports for an interface, for the DD Interface-MTU
+/// field on tunnels. VPP's per-protocol MTU array is `[L3, IP4, IP6,
+/// MPLS]`; the L3 entry is the IP MTU. Falls back to `link_mtu`, then
+/// 1500. Only meaningful for tunnels whose VPP MTU ecrd has set to the
+/// real value — plain Ethernet reports the jumbo internal MTU, so the
+/// callers advertise 1500 there instead.
+fn vpp_ip_mtu(vi: &vpp_api::generated::interface::SwInterfaceDetails) -> u16 {
+    let m = if vi.mtu[0] != 0 {
+        vi.mtu[0]
+    } else {
+        vi.link_mtu as u32
+    };
+    if m == 0 || m > u16::MAX as u32 {
+        1500
+    } else {
+        m as u16
+    }
+}
+
 fn compute_l3_peer(
     name: &str,
     dev_type: &str,
     address: std::net::Ipv4Addr,
     mask: std::net::Ipv4Addr,
 ) -> Option<std::net::Ipv4Addr> {
-    let d = dev_type.to_ascii_lowercase();
-    let is_tunnel = d.contains("gre")
-        || d.contains("ipip")
-        || d.contains("tunnel")
-        || name.starts_with("gre")
-        || name.starts_with("ipip");
-    if !is_tunnel {
+    if !is_l3_tunnel(name, dev_type) {
         return None;
     }
     let addr = u32::from(address);
@@ -1597,6 +1624,14 @@ async fn build_v2_setup(
         } else {
             None
         };
+        // Advertise the tunnel's real IP MTU in DD packets; plain
+        // Ethernet keeps 1500 (see OspfInterface::dd_mtu).
+        iface.dd_mtu = if is_l3_tunnel(&iface.name, &vpp_iface.interface_dev_type) {
+            vpp_ip_mtu(vpp_iface)
+        } else {
+            1500
+        };
+
         io_interfaces.push(IoInterface {
             name: iface.name.clone(),
             sw_if_index: iface.sw_if_index,
@@ -1834,6 +1869,11 @@ async fn enrollment_task(
                         iface.address = addr;
                         iface.mask = mask;
                     }
+                    iface.dd_mtu = if is_l3_tunnel(&iface.name, &vi.interface_dev_type) {
+                        vpp_ip_mtu(vi)
+                    } else {
+                        1500
+                    };
                     iface.handle_event(&InterfaceEvent::InterfaceUp);
                     let resolved = (iface.address, iface.mask);
                     inst.originate_router_lsa();

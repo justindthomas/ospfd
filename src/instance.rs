@@ -1067,9 +1067,9 @@ impl OspfInstance {
         neighbor_id: Ipv4Addr,
         initial: bool,
     ) -> Option<OspfPacket> {
-        let (area_id, options) = {
+        let (area_id, options, dd_mtu) = {
             let iface = self.interfaces.get(iface_idx)?;
-            (iface.area_id, iface.options)
+            (iface.area_id, iface.options, iface.dd_mtu)
         };
 
         let iface = self.interfaces.get_mut(iface_idx)?;
@@ -1122,10 +1122,11 @@ impl OspfInstance {
         };
 
         let dd = crate::packet::dd::DbDescPacket {
-            // TAP-backed OSPF interfaces all use 1500 on this platform;
-            // if we ever support jumbo frames this will need to come
-            // from sw_interface_dump's link_mtu field.
-            interface_mtu: 1500,
+            // Per-interface (RFC 2328 §10.6). 1500 for Ethernet (matches
+            // the peer; VPP's reported L3 MTU is the jumbo internal
+            // value, not the wire MTU); the tunnel's real IP MTU for a
+            // GRE/IPIP interface, read from VPP at resolution.
+            interface_mtu: dd_mtu,
             options,
             flags,
             dd_sequence_number: seq_used,
