@@ -287,6 +287,20 @@ pub async fn run(
             };
             let _ = std::fs::create_dir_all("/run/ospfd");
             let vpp_server_path = register_punt_v6(&vpp, &client_path).await?;
+            // VPP delivers OSPFv3's link-local multicast (ff02::5 AllSPFRouters /
+            // ff02::6 AllDRRouters) to our proto-89 punt only when an ip6 mfib
+            // entry exists. IPv4's 224.0.0.5/6 are punted by default; IPv6's are
+            // dropped without this, so ospfd egresses hellos (the peer sees us)
+            // but never receives the peer's and no adjacency forms (interfaces
+            // stuck Waiting). Program it for every enrolled interface.
+            let v3_sw_if_indexes: Vec<u32> =
+                cfg.interfaces.iter().map(|ic| ic.sw_if_index).collect();
+            if let Err(e) = program_v6_mcast_mfib(&vpp, &v3_sw_if_indexes).await {
+                tracing::warn!(
+                    error = %e,
+                    "OSPFv3 multicast mfib programming failed; v3 adjacencies may not form"
+                );
+            }
             crate::io_v3::Ospfv3Io::Punt(crate::io_punt_v3::PuntSocketIoV3::new(
                 io_ifaces,
                 &client_path,
@@ -516,6 +530,56 @@ async fn register_punt_v6(
         "registered punt socket for IPv6 proto 89"
     );
     Ok(server)
+}
+
+/// Program ip6 mfib entries for the OSPFv3 link-local multicast groups so VPP
+/// delivers them to our proto-89 punt. ff02::5 (AllSPFRouters) and ff02::6
+/// (AllDRRouters) each get a local-receive path plus an RPF Accept on every
+/// enrolled interface — mirroring `ip mroute add <grp> via local Forward` and
+/// `ip mroute add <grp> via <itf> Accept`. IPv4's 224.0.0.5/6 are punted by
+/// default; IPv6's are dropped without this.
+async fn program_v6_mcast_mfib(
+    vpp: &vpp_api::VppClient,
+    sw_if_indexes: &[u32],
+) -> anyhow::Result<()> {
+    use vpp_api::generated::ip::{
+        IpMroute, IpMrouteAddDel, IpMrouteAddDelReply, MfibPath, Mprefix,
+    };
+    // ff02::5 (AllSPFRouters), ff02::6 (AllDRRouters).
+    const GROUPS: [[u8; 16]; 2] = [
+        [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05],
+        [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x06],
+    ];
+    for grp in GROUPS {
+        // One mfib path per add_del (is_multipath). The local-receive path
+        // creates the entry; an Accept path per interface follows.
+        let mut paths = vec![MfibPath::local_receive_ipv6()];
+        paths.extend(sw_if_indexes.iter().map(|&i| MfibPath::accept_ipv6(i)));
+        for path in paths {
+            let req = IpMrouteAddDel {
+                is_add: true,
+                is_multipath: true,
+                route: IpMroute {
+                    table_id: 0,
+                    entry_flags: 0,
+                    rpf_id: 0,
+                    prefix: Mprefix::ipv6_group(grp, 128),
+                    paths: vec![path],
+                },
+            };
+            let reply: IpMrouteAddDelReply = vpp
+                .request::<IpMrouteAddDel, IpMrouteAddDelReply>(req)
+                .await
+                .map_err(|e| anyhow::anyhow!("ip_mroute_add_del (v6 mcast): {}", e))?;
+            if reply.retval != 0 {
+                tracing::warn!(
+                    retval = reply.retval,
+                    "ip6 multicast mfib add returned non-zero"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Discovered IPv6 addresses on a single interface (from VPP).
