@@ -36,6 +36,8 @@ fn io(name: &str, sw_if_index: u32, ll: &str) -> IoInterfaceV3 {
         kernel_ifindex: sw_if_index,
         link_local: ll.parse().unwrap(),
         mac_address: [0; 6],
+        outer_vlan_id: None,
+        inner_vlan_id: None,
     }
 }
 
@@ -457,6 +459,7 @@ fn abr_v3_2_per_area_router_lsa_scopes_links() {
             pending_acks: Vec::new(),
             pending_lsu: Vec::new(),
             lsr_pending: false,
+            last_lsr_sent: None,
             dd_send_final: false,
             dd_peer_done: false,
         };
