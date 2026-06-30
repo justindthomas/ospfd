@@ -37,6 +37,18 @@ pub struct LsaEntryV3 {
 #[derive(Debug, Default)]
 pub struct LsdbV3 {
     entries: HashMap<LsaKeyV3, LsaEntryV3>,
+    /// Monotonic counter bumped whenever the LSDB's *content* changes
+    /// — i.e. a new LSA instance is installed (new key, or a fresher
+    /// instance of an existing key). Unchanged re-inserts (same
+    /// sequence number and checksum) do NOT bump it.
+    ///
+    /// The OSPFv3 daemon loop schedules SPF on a change in this value
+    /// rather than on `len()`, because an in-place LSA update (FRR
+    /// re-originating its Intra-Area-Prefix-LSA to add a loopback
+    /// prefix, say) keeps `len()` constant while genuinely changing
+    /// the routing inputs. Gating SPF on `len()` alone silently
+    /// dropped such updates (see daemon_v3 SPF tick).
+    generation: u64,
 }
 
 impl LsdbV3 {
@@ -51,7 +63,28 @@ impl LsdbV3 {
             link_state_id: entry.header.link_state_id,
             advertising_router: entry.header.advertising_router,
         };
+        // Only treat this as a content change (and bump the
+        // generation) when the installed instance is genuinely
+        // different from what we already hold. OSPF identifies a
+        // distinct LSA instance by (sequence number, checksum); a
+        // re-flood of the same instance must not perturb SPF
+        // scheduling.
+        let changed = match self.entries.get(&key) {
+            Some(existing) => {
+                existing.header.ls_sequence_number != entry.header.ls_sequence_number
+                    || existing.header.ls_checksum != entry.header.ls_checksum
+            }
+            None => true,
+        };
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.entries.insert(key, entry);
+    }
+
+    /// Content-change generation counter. See the field doc.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn get(&self, key: &LsaKeyV3) -> Option<&LsaEntryV3> {
@@ -106,5 +139,57 @@ mod tests {
             advertising_router: Ipv4Addr::new(1, 1, 1, 1),
         };
         assert!(db.get(&key).is_some());
+    }
+
+    fn entry(seq: i32, checksum: u16) -> LsaEntryV3 {
+        LsaEntryV3 {
+            header: LsaV3Header {
+                ls_age: 0,
+                ls_type: LsaV3Type::IntraAreaPrefix,
+                link_state_id: Ipv4Addr::new(0, 0, 0, 5),
+                advertising_router: Ipv4Addr::new(9, 9, 9, 9),
+                ls_sequence_number: seq,
+                ls_checksum: checksum,
+                length: 24,
+            },
+            raw: vec![0; 24],
+            area: Some(Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
+    // Regression: SPF in the v3 daemon loop is scheduled on a change in
+    // the generation counter. An in-place LSA update (same key, fresher
+    // instance) must bump the generation even though len() is unchanged
+    // — otherwise the recomputed route never reaches ribd / the FIB.
+    #[test]
+    fn generation_bumps_on_in_place_update_not_on_duplicate() {
+        let mut db = LsdbV3::new();
+        assert_eq!(db.generation(), 0);
+
+        // First install of a key.
+        db.insert(entry(0x80000001u32 as i32, 0x1111));
+        assert_eq!(db.len(), 1);
+        let g1 = db.generation();
+        assert_eq!(g1, 1, "first install must bump generation");
+
+        // Re-flood of the *same* instance (same seq + checksum): no
+        // content change, generation must not move.
+        db.insert(entry(0x80000001u32 as i32, 0x1111));
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.generation(), g1, "duplicate re-flood must not bump");
+
+        // Fresher instance (new seq): same key, len() unchanged, but
+        // content changed — generation MUST bump so SPF re-runs.
+        db.insert(entry(0x80000002u32 as i32, 0x2222));
+        assert_eq!(db.len(), 1, "len unchanged on in-place update");
+        assert_eq!(
+            db.generation(),
+            g1 + 1,
+            "in-place LSA update must bump generation"
+        );
+
+        // Same seq but different checksum (defensive): treat as changed.
+        db.insert(entry(0x80000002u32 as i32, 0x3333));
+        assert_eq!(db.generation(), g1 + 2);
     }
 }

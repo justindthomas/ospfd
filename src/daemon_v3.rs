@@ -315,8 +315,18 @@ pub async fn run(
     };
 
     let mut rib = OspfRibV3::new();
-    let mut last_lsdb_size = 0usize;
-    let mut last_neighbor_count = 0usize;
+    // SPF is scheduled on a *content* change in the LSDB (generation
+    // counter) or a change in the Full-neighbor count — not on
+    // `lsdb.len()`. An in-place LSA update (e.g. a peer re-originating
+    // its Intra-Area-Prefix-LSA to add a loopback prefix) leaves
+    // `len()` unchanged but must still trigger a recompute, otherwise
+    // the new prefix never reaches ribd / the VPP FIB.
+    let mut last_lsdb_generation = u64::MAX;
+    let mut last_neighbor_count = usize::MAX;
+    // Set by the periodic interface refresh when an interface's
+    // address/oper state changes, to force a recompute even if the
+    // LSDB generation and neighbor count are otherwise stable.
+    let mut force_spf = false;
 
     // Connect to ribd. v3 uses its own RibClient so its
     // connection lifecycle is independent from v2. Stamp the
@@ -442,8 +452,7 @@ pub async fn run(
                 if any_change {
                     inst.refresh_router_lsa_if_needed();
                     // Force SPF on next tick
-                    last_lsdb_size = 0;
-                    last_neighbor_count = 0;
+                    force_spf = true;
                 }
                 drop(inst);
                 // Refresh Type 5 LSAs too (prefix set may have changed
@@ -462,11 +471,12 @@ pub async fn run(
             _ = spf_tick.tick() => {
                 // Compute routes under the lock, then release before
                 // the async VPP apply.
-                let (lsdb_size, neighbor_count, routes) = {
+                let (lsdb_generation, neighbor_count, routes) = {
                     let mut inst = instance.lock().await;
-                    let lsdb_size = inst.lsdb.len();
+                    let gen_before = inst.lsdb.generation();
                     let neighbors = inst.spf_neighbors();
-                    if lsdb_size == last_lsdb_size
+                    if !force_spf
+                        && gen_before == last_lsdb_generation
                         && neighbors.len() == last_neighbor_count
                     {
                         continue;
@@ -477,12 +487,21 @@ pub async fn run(
                     // area prefixes.
                     inst.originate_inter_area_prefix_lsas();
                     let routes = calculate_spf_v3(cfg.router_id, &inst.lsdb, &neighbors);
-                    (lsdb_size, neighbors.len(), routes)
+                    // Record the generation *after* our own
+                    // re-origination. On an ABR, originate_inter_area_
+                    // prefix_lsas bumps the generation every cycle; if
+                    // we stored the pre-origination value we'd see a
+                    // change next tick and busy-loop SPF. A genuine
+                    // peer LSA update bumps the generation again and is
+                    // still caught.
+                    let gen_after = inst.lsdb.generation();
+                    (gen_after, neighbors.len(), routes)
                 };
-                last_lsdb_size = lsdb_size;
+                force_spf = false;
+                last_lsdb_generation = lsdb_generation;
                 last_neighbor_count = neighbor_count;
                 tracing::debug!(
-                    lsdb = lsdb_size,
+                    lsdb_generation,
                     neighbors = neighbor_count,
                     routes = routes.len(),
                     "OSPFv3 SPF run"
