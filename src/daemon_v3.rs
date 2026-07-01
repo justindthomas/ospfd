@@ -351,6 +351,25 @@ pub async fn run(
     let mut expire_tick = tokio::time::interval(Duration::from_secs(1));
     let mut spf_tick = tokio::time::interval(Duration::from_secs(2));
     spf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Periodic ribd reconcile. The `spf_tick` arm below only recomputes
+    // and re-pushes when its coarse (lsdb_generation, neighbor_count)
+    // delta-gate opens. That gate has two blind spots that can strand a
+    // route in ribd forever:
+    //   1. The SPF *result* can change without either key changing — e.g.
+    //      the first post-Full SPF fires a beat before the peer's
+    //      Intra-Area-Prefix-LSA / transit topology settles, computes 0
+    //      routes, pushes an empty bulk, and advances the gate; the route
+    //      appears one LSDB beat later but the gate never re-opens.
+    //   2. On `systemctl restart ecrd` the supervisor restarts ospfd and
+    //      ribd together. A bulk that landed on a ribd instance that then
+    //      restarted (or a push that failed while ribd was mid-init) is
+    //      lost, and the delta-gate never re-pushes it.
+    // Forcing SPF here on a fixed cadence makes any such divergence
+    // between "what SPF currently yields" and "what ribd holds" self-heal
+    // within one reconcile interval. push_bulk is idempotent, so a
+    // steady-state reconcile is a cheap no-op in ribd.
+    let mut reconcile_tick = tokio::time::interval(Duration::from_secs(10));
+    reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Same startup-race avoidance as v2 (see main.rs::iface_refresh):
     // skip the immediate first tick so we don't transiently see an
     // empty IpAddressDump and demote the interface back to Down.
@@ -468,6 +487,13 @@ pub async fn run(
                 }
             }
 
+            _ = reconcile_tick.tick() => {
+                // Force the spf_tick arm to recompute + re-push on its
+                // next fire, bypassing the delta-gate. See the
+                // reconcile_tick construction above for the rationale.
+                force_spf = true;
+            }
+
             _ = spf_tick.tick() => {
                 // Compute routes under the lock, then release before
                 // the async VPP apply.
@@ -497,9 +523,6 @@ pub async fn run(
                     let gen_after = inst.lsdb.generation();
                     (gen_after, neighbors.len(), routes)
                 };
-                force_spf = false;
-                last_lsdb_generation = lsdb_generation;
-                last_neighbor_count = neighbor_count;
                 tracing::debug!(
                     lsdb_generation,
                     neighbors = neighbor_count,
@@ -530,11 +553,25 @@ pub async fn run(
                 // Push to ribd. push_v6 splits by sub-type
                 // (intra / inter / ext1 / ext2) into four separate
                 // Bulks for ribd admin-distance arbitration.
-                if let Err(e) = rib_client
-                    .push_v6(&routes, |_kind| ad_override_v6)
-                    .await
-                {
-                    tracing::warn!("OSPFv3 ribd push failed: {}", e);
+                //
+                // Only advance the delta-gate on a *successful* push. If
+                // the push fails (ribd mid-restart, socket dropped past
+                // the single in-client retry), leave last_* untouched and
+                // force a retry on the next tick — otherwise the gate
+                // would swallow the failed push and the route would be
+                // stranded in ospfd until the next genuine LSDB change.
+                match rib_client.push_v6(&routes, |_kind| ad_override_v6).await {
+                    Ok(()) => {
+                        force_spf = false;
+                        last_lsdb_generation = lsdb_generation;
+                        last_neighbor_count = neighbor_count;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "OSPFv3 ribd push failed: {} — will retry next tick", e
+                        );
+                        force_spf = true;
+                    }
                 }
             }
         }
